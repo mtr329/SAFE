@@ -195,6 +195,38 @@ class LstmModelConfig(ModelConfig):
     
     cumsum: bool = False
     rmean: bool = False
+
+@dataclass
+class TransModelConfig(ModelConfig):
+    name: str = "trans"
+    n_layers: int = 2
+    hidden_dim: int = 64
+    n_heads: int = 4
+    ff_dim: int = 64
+    n_history_steps: int = -1 # -1 means use all history information
+    one_loss_per_seq: bool = False
+    use_time_gate: bool = False
+    time_gate_tau_init: float = 0.2
+    time_gate_k: float = 10.0
+    time_gate_a: float = 0.4
+    use_pairwise_auc: bool = True
+    lambda_pairwise_auc: float = 1.0
+    pairwise_auc_beta: float = 10.0
+    dropout: float = 0.5
+
+    lr: float = 1e-4
+    lambda_reg: float = 0.1
+    grad_max_norm: float = 1.0
+    lambda_hard_heg: float = 0.0
+    hard_neg_margin: float = 0.1
+    hard_neg_beta: float = 50.0
+
+    cumsum: bool = False
+    rmean: bool = False
+
+    n_epochs: int = 1000
+    use_time_weighting: bool = True
+    weight_decay: float = 1e-4
     
 @dataclass
 class EmbedModelConfig(ModelConfig):
@@ -300,6 +332,7 @@ cs.store(group="dataset", name="base_pizero_fast_droid", node=PizeroFastDroidDat
 # Register model variants into the "model" config group.
 cs.store(group="model", name="base_indep", node=IndepModelConfig)
 cs.store(group="model", name="base_lstm", node=LstmModelConfig)
+cs.store(group="model", name="base_trans", node=TransModelConfig)
 cs.store(group="model", name="base_embed", node=EmbedModelConfig)
 cs.store(group="model", name="base_rnd", node=RNDModelConfig)
 cs.store(group="model", name="base_logpzo", node=LogpZOModelConfig)

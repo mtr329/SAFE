@@ -1,18 +1,11 @@
-# Automatic the processing of metrics from wandb
+# Automatic processing of metrics from local W&B logs (offline)
 import argparse
 import os
 import pandas as pd
 
-import wandb
+from get_local_wandb_metrics import pull_metrics_from_group_v2_local
 
-from failure_prob.utils.wandb import (
-    pull_metrics_from_group_v2,
-)
-
-# initialize the API
-WANDB_USERNAME = wandb.Api().viewer.username
-
-WANBD_PROJECT_NAME = f"{WANDB_USERNAME}/vla-safe"
+WANBD_PROJECT_NAME = "local"
 
 
 WANDB_META_V2 = {
@@ -245,7 +238,7 @@ def main(args: argparse.Namespace):
     if args.meta not in META_MAP.keys():
         raise ValueError(f"Invalid meta version: {args.meta}")
     else:
-        SAVE_ROOT = f"./scripts/wandb_metrics_batch_{args.meta}"
+        SAVE_ROOT = args.save_root or f"./scripts/wandb_metrics_batch_{args.meta}"
         WANDB_META = META_MAP[args.meta]
 
     os.makedirs(SAVE_ROOT, exist_ok=True)
@@ -261,7 +254,6 @@ def main(args: argparse.Namespace):
         print(f"Processing {benchmark_name}...")
         benchmark_best = []
         for group in benchmark:
-            project_name = group["project_name"]
             group_names = group["group_names"]
             exp_suffixes = group["exp_suffixes"]
             ablated_configs = group["ablated_configs"]
@@ -276,9 +268,13 @@ def main(args: argparse.Namespace):
                 **extra_filters,
             }
             
-            compare_df = pull_metrics_from_group_v2(
-                project_name, group_names, ablated_configs, group_configs, filters
+            compare_df = pull_metrics_from_group_v2_local(
+                args.log_root, group_names, ablated_configs, group_configs, filters
             )
+
+            if compare_df.empty:
+                print("[warn] no runs matched; skipping")
+                continue
             
             # Convert the learning rate to string
             if "model.lr" in compare_df.columns:
@@ -381,5 +377,17 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--meta", type=str, default="v2", help="The meta version to use")
     parser.add_argument("--benchmark", type=str, default="all", help="The benchmark to process")
+    parser.add_argument(
+        "--log_root",
+        type=str,
+        default="./log_wandb/pi0fast_libero",
+        help="Local W&B log root that contains run-* directories",
+    )
+    parser.add_argument(
+        "--save_root",
+        type=str,
+        default="",
+        help="Optional output directory for CSVs",
+    )
     args = parser.parse_args()
     main(args)
