@@ -7,10 +7,9 @@ export CUDA_VISIBLE_DEVICES=1
 SAFE_OPENPI_ROLLOUT_ROOT=/data1/mtr/data/safe_rollouts/
 WANDB_DIR=./wandb_trans
 
-# Trans2-style baseline + single-factor ablation:
-# - keep encoded feature only
-# - keep stable trans2-like optimization
-# - only ablate prefix_pairwise on/off
+# Locked best-known trans setting:
+# - fixed hyperparameters
+# - multi-seed only (0,1,2)
 python -m failure_prob.train \
     --multirun \
     train.wandb_group_name=${GROUP_NAME} \
@@ -26,9 +25,9 @@ python -m failure_prob.train \
     model.use_prefix_pairwise_auc=False,True \
     model.lambda_prefix_pairwise_auc=0.01 \
     model.prefix_pairwise_ratio=0.4 \
-    model.dropout=0.2,0.3 \
+    model.dropout=0.2 \
     model.lr=1e-4 \
-    model.lambda_reg=0.1,0.2 \
+    model.lambda_reg=0.1 \
     model.use_time_weighting=True \
     train.seed=0-1-2 \
     train.exp_suffix=trans
