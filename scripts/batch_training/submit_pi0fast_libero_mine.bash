@@ -3,7 +3,7 @@
 # Run all experiments for Pi0-FAST model on the LIBERO rollouts
 
 GROUP_NAME=pi0fast_libero_v4
-export CUDA_VISIBLE_DEVICES=2
+export CUDA_VISIBLE_DEVICES=1
 SAFE_OPENPI_ROLLOUT_ROOT=/data1/mtr/data/safe_rollouts/
 WANDB_DIR=./wandb_trans
 

@@ -3,7 +3,9 @@ import argparse
 import os
 import pandas as pd
 
-from get_local_wandb_metrics import pull_metrics_from_group_v2_local
+from failure_prob.utils.wandb import (
+    pull_metrics_from_group_v2_local,
+)
 
 WANBD_PROJECT_NAME = "local"
 
@@ -14,7 +16,7 @@ WANDB_META_V2 = {
         {
             "project_name": WANBD_PROJECT_NAME,
             "group_names": ["pi0fast_libero_v4"],
-            "exp_suffixes": ["lstm", "mlp"],
+            "exp_suffixes": ["lstm", "mlp", "trans"],
             "ablated_configs": ["model.name", "dataset.feat_name", "dataset.token_idx_rel", "model.lr", "model.lambda_reg"],
             "group_configs": ["train.seed"],
             "extra_filters": {},
@@ -57,7 +59,7 @@ WANDB_META_V2 = {
         {
             "project_name": WANBD_PROJECT_NAME,
             "group_names": ["openvla_libero_v2"],
-            "exp_suffixes": ["lstm", "mlp"],
+            "exp_suffixes": ["lstm", "mlp", "trans"],
             "ablated_configs": ["model.name", "dataset.token_idx_rel", "model.lr", "model.lambda_reg"],
             "group_configs": ["train.seed"],
             "extra_filters": {},
@@ -100,7 +102,7 @@ WANDB_META_V2 = {
         {
             "project_name": WANBD_PROJECT_NAME,
             "group_names": ["pi0diff_libero_v1"],
-            "exp_suffixes": ["lstm", "mlp"],
+            "exp_suffixes": ["lstm", "mlp", "trans"],
             "ablated_configs": ["model.name", "dataset.horizon_idx_rel", "dataset.diff_idx_rel", "model.lr", "model.lambda_reg"],
             "group_configs": ["train.seed"],
             "extra_filters": {},
@@ -143,7 +145,7 @@ WANDB_META_V2 = {
         {
             "project_name": WANBD_PROJECT_NAME,
             "group_names": ["opi0_simpler_v1"],
-            "exp_suffixes": ["lstm", "mlp"],
+            "exp_suffixes": ["lstm", "mlp", "trans"],
             "ablated_configs": ["model.name", "dataset.horizon_idx_rel", "dataset.diff_idx_rel", "model.lr", "model.lambda_reg"],
             "group_configs": ["train.seed", "dataset.subset_name"],
             "extra_filters": {},
@@ -380,13 +382,13 @@ if __name__ == "__main__":
     parser.add_argument(
         "--log_root",
         type=str,
-        default="./log_wandb/pi0fast_libero",
+        default="wandb_trans/wandb",
         help="Local W&B log root that contains run-* directories",
     )
     parser.add_argument(
         "--save_root",
         type=str,
-        default="",
+        default="log_trans_csv_2",
         help="Optional output directory for CSVs",
     )
     args = parser.parse_args()

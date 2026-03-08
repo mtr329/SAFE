@@ -212,6 +212,9 @@ class TransModelConfig(ModelConfig):
     use_pairwise_auc: bool = True
     lambda_pairwise_auc: float = 1.0
     pairwise_auc_beta: float = 10.0
+    use_prefix_pairwise_auc: bool = False
+    lambda_prefix_pairwise_auc: float = 0.0
+    prefix_pairwise_ratio: float = 0.4
     dropout: float = 0.5
 
     lr: float = 1e-4
@@ -224,7 +227,7 @@ class TransModelConfig(ModelConfig):
     cumsum: bool = False
     rmean: bool = False
 
-    n_epochs: int = 1000
+    n_epochs: int = 400
     use_time_weighting: bool = True
     weight_decay: float = 1e-4
     

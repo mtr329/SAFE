@@ -1,7 +1,16 @@
 import json
+import os
 import warnings
+from pathlib import Path
+from typing import Any
+
 import wandb
 import pandas as pd
+
+try:
+    import yaml
+except Exception:  # pragma: no cover
+    yaml = None
 
 
 def check_pivot_duplicate(
@@ -84,8 +93,7 @@ def pull_metrics_from_group_v2(
             compare_df[col] = compare_df[col].fillna(16)
         else:
             compare_df[col] = compare_df[col].fillna("default")
-            
-        
+
     # Make info_configs columns also be a kind of split
     if info_configs:
         new_rows = []
@@ -102,7 +110,12 @@ def pull_metrics_from_group_v2(
         new_df = pd.DataFrame(new_rows)
         compare_df = pd.concat([compare_df, new_df], ignore_index=True)
         compare_df = compare_df.drop(columns=info_configs)
-            
+
+    # If some swept configs are not listed in ablated_configs, multiple runs can collapse
+    # into the same visible key. Keep the best value instead of an arbitrary first row.
+    dedup_cols = ["metric", "method", "split"] + group_configs + ablated_configs
+    compare_df = compare_df.groupby(dedup_cols, as_index=False)["value"].max()
+
     
     if group_configs:
         # Just the mean
@@ -280,6 +293,196 @@ def get_runs_df(
     return pd.DataFrame(data)
 
 
+def _unwrap_local_value(node: Any) -> Any:
+    if isinstance(node, dict) and "value" in node and len(node) == 1:
+        return _unwrap_local_value(node["value"])
+    if isinstance(node, dict):
+        return {k: _unwrap_local_value(v) for k, v in node.items()}
+    if isinstance(node, list):
+        return [_unwrap_local_value(v) for v in node]
+    return node
+
+
+def _is_simple_value(v: Any) -> bool:
+    return isinstance(v, (int, float, str, bool)) or v is None
+
+
+def _parse_local_run_id(run_dir_name: str) -> str:
+    # run-YYYYMMDD_HHMMSS-<id>
+    parts = run_dir_name.split("-")
+    return parts[-1] if len(parts) >= 3 else run_dir_name
+
+
+def _apply_local_filters(df: pd.DataFrame, filters: dict | None) -> pd.DataFrame:
+    if not filters:
+        return df
+
+    for key, cond in filters.items():
+        if key == "group":
+            col = "group"
+        elif key.startswith("config."):
+            col = key[len("config.") :]
+        else:
+            col = key
+
+        if col not in df.columns:
+            print(f"[warn] filter column not found: {col} (from {key})")
+            continue
+
+        if isinstance(cond, dict) and "$in" in cond:
+            df = df[df[col].isin(cond["$in"])].copy()
+        else:
+            df = df[df[col] == cond].copy()
+    return df
+
+
+def load_local_runs_df(log_root: str, filters: dict | None = None) -> pd.DataFrame:
+    if yaml is None:
+        raise ImportError("PyYAML is required to parse local W&B config.yaml")
+
+    log_root = os.path.abspath(log_root)
+    if not os.path.isdir(log_root):
+        raise FileNotFoundError(f"log_root not found: {log_root}")
+
+    rows = []
+    for run_dir in sorted(Path(log_root).glob("run-*/")):
+        files_dir = run_dir / "files"
+        summary_path = files_dir / "wandb-summary.json"
+        config_path = files_dir / "config.yaml"
+
+        if not summary_path.exists() or not config_path.exists():
+            continue
+
+        with summary_path.open("r") as f:
+            summary = json.load(f)
+        with config_path.open("r") as f:
+            config_raw = yaml.safe_load(f)
+
+        config_unwrapped = _unwrap_local_value(config_raw or {})
+        if isinstance(config_unwrapped, dict):
+            config_unwrapped.pop("_wandb", None)
+        config_flat = flatten_dict(config_unwrapped if isinstance(config_unwrapped, dict) else {})
+
+        run_dir_name = run_dir.name
+        run_id = _parse_local_run_id(run_dir_name)
+        row: dict[str, Any] = {
+            "name": run_dir_name,
+            "_id": run_id,
+            "group": config_flat.get("train.wandb_group_name"),
+            "_project": config_flat.get("train.wandb_project"),
+        }
+
+        for k, v in summary.items():
+            if _is_simple_value(v):
+                row[k] = v
+        row.update(config_flat)
+        rows.append(row)
+
+    df = pd.DataFrame(rows)
+    return _apply_local_filters(df, filters)
+
+
+def pull_metrics_from_group_v2_local(
+    log_root: str,
+    group_names: list[str],
+    ablated_configs: list[str],
+    group_configs: list[str],
+    filters: dict | None = None,
+    return_wandb_info: bool = False,
+) -> pd.DataFrame:
+    assert isinstance(group_configs, list)
+
+    info_configs: list[str] = []
+    if return_wandb_info:
+        info_configs = ["_project", "_id"]
+
+    runs_df = load_local_runs_df(log_root, filters)
+    print(f"Loaded {len(runs_df)} runs from {log_root}")
+    if runs_df.empty:
+        print("No runs found; skipping metrics aggregation.")
+        return pd.DataFrame()
+
+    split_df = parse_runs_df_to_split_df_v2(
+        runs_df,
+        group_configs + ablated_configs + info_configs,
+    )
+
+    for col in group_configs:
+        split_df[col] = split_df[col].astype(str)
+
+    compare_df = split_df[split_df['metric'].str.contains("falert")]
+
+    compare_df[['metric', 'method']] = compare_df['metric'].str.split('/', expand=True)
+    cols = compare_df.columns.tolist()
+    cols.insert(0, cols.pop(cols.index('metric')))
+    cols.insert(1, cols.pop(cols.index('method')))
+    compare_df = compare_df[cols]
+
+    compare_df = compare_df.sort_values(by=group_configs + ['split'])
+
+    for col in ablated_configs:
+        if col == "model.pca_dim":
+            compare_df[col] = compare_df[col].fillna(64)
+        elif col == "model.n_clusters":
+            compare_df[col] = compare_df[col].fillna(16)
+        else:
+            compare_df[col] = compare_df[col].fillna("default")
+
+    if info_configs:
+        new_rows = []
+        for i, row in compare_df.iterrows():
+            if row['split'] == "train":
+                for col in info_configs:
+                    new_row = row.to_dict().copy()
+                    new_row['split'] = col
+                    new_row['value'] = compare_df.loc[i, col]
+                    new_rows.append(new_row)
+
+        new_df = pd.DataFrame(new_rows)
+        compare_df = pd.concat([compare_df, new_df], ignore_index=True)
+        compare_df = compare_df.drop(columns=info_configs)
+
+    # Keep the best value when hidden sweep dimensions collapse to the same visible key.
+    dedup_cols = ["metric", "method", "split"] + group_configs + ablated_configs
+    compare_df = compare_df.groupby(dedup_cols, as_index=False)["value"].max()
+
+    if group_configs:
+        compare_df_suite_mean = df_group_mean_except(
+            compare_df,
+            group_configs,
+            ['value'],
+        )
+        for col in group_configs:
+            compare_df_suite_mean[col] = "avg"
+        compare_df = pd.concat([compare_df_suite_mean, compare_df])
+
+        compare_df_suite_mean = df_group_mean_except(
+            compare_df,
+            group_configs,
+            ['value'],
+            mean_std=True,
+        )
+        for col in group_configs:
+            compare_df_suite_mean[col] = "avg_mstd"
+        compare_df = pd.concat([compare_df_suite_mean, compare_df])
+
+    pivot_df = compare_df.pivot_table(
+        index=["metric", "method"] + ablated_configs,
+        columns=group_configs + ["split"],
+        values="value",
+        aggfunc="first",
+    ).reset_index()
+
+    if len(group_configs) == 0:
+        pivot_df.columns = [a if len(b) == 0 else b for a, b in pivot_df.columns]
+    elif len(group_configs) == 1:
+        pivot_df.columns = [a if len(b) == 0 else f"{a}-{b}" for a, b in pivot_df.columns]
+    elif len(group_configs) == 2:
+        pivot_df.columns = [a if len(b) == 0 else f"{a}-{b}-{c}" for a, b, c in pivot_df.columns]
+
+    return pivot_df
+
+
 def load_summary_tables_from_runs(
     runs: list[wandb.apis.public.Run],
     api = wandb.Api(),
@@ -445,4 +648,3 @@ def df_group_mean_except(
     agg = {col: agg_func for col in mean_value_cols}
     df = df.groupby(group_cols).agg(agg).reset_index()
     return df
-

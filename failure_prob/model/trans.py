@@ -47,6 +47,9 @@ class TransModel(BaseModel):
         self.use_pairwise_auc = cfg.model.use_pairwise_auc
         self.lambda_pairwise_auc = cfg.model.lambda_pairwise_auc
         self.pairwise_auc_beta = cfg.model.pairwise_auc_beta
+        self.use_prefix_pairwise_auc = cfg.model.use_prefix_pairwise_auc
+        self.lambda_prefix_pairwise_auc = cfg.model.lambda_prefix_pairwise_auc
+        self.prefix_pairwise_ratio = cfg.model.prefix_pairwise_ratio
         if self.use_time_gate:
             # Learnable gate center in normalized time (0..1)
             eps = 1e-4
@@ -134,6 +137,7 @@ class TransModel(BaseModel):
     ) -> torch.Tensor:
         # Compute a differentiable pairwise AUC loss on sequence-level scores.
         # scores: (B, T), labels: (B,), valid_masks: (B, T)
+        # labels should be failure labels: 1 for failure (positive), 0 for success (negative).
         if scores.numel() == 0:
             return scores.new_tensor(0.0)
 
@@ -154,6 +158,23 @@ class TransModel(BaseModel):
         # Pairwise logistic loss: encourage pos > neg.
         diff = pos[:, None] - neg[None, :]
         return torch.nn.functional.softplus(-diff).mean()
+
+
+    def _build_prefix_valid_masks(self, valid_masks: torch.Tensor) -> torch.Tensor:
+        # Build a prefix-only valid mask per sequence to approximate early-window optimization.
+        if not (0.0 < float(self.prefix_pairwise_ratio) <= 1.0):
+            raise ValueError(
+                f"prefix_pairwise_ratio must be in (0, 1], got {self.prefix_pairwise_ratio}"
+            )
+
+        B, T = valid_masks.shape
+        seq_lengths = valid_masks.sum(dim=1).long().clamp(min=1, max=T)  # (B,)
+        prefix_lengths = torch.ceil(seq_lengths.float() * float(self.prefix_pairwise_ratio)).long()
+        prefix_lengths = prefix_lengths.clamp(min=1, max=T)  # (B,)
+
+        t_idx = torch.arange(T, device=valid_masks.device).unsqueeze(0).expand(B, -1)  # (B, T)
+        prefix_masks = (t_idx < prefix_lengths.unsqueeze(1)).to(valid_masks.dtype)  # (B, T)
+        return prefix_masks * valid_masks
 
 
     def forward_compute_loss(
@@ -241,12 +262,23 @@ class TransModel(BaseModel):
             )
             hard_neg_loss = self.cfg.model.lambda_hard_heg * hard_neg_loss
         
+        # Align pairwise AUC with BCE target: failure is positive class.
+        failure_labels = 1 - success_labels
+
         pairwise_auc_loss = torch.tensor(0.0).to(scores)
         if self.use_pairwise_auc and self.lambda_pairwise_auc > 0:
-            pairwise_auc_loss = self._pairwise_auc_loss(scores, success_labels, valid_masks)
+            pairwise_auc_loss = self._pairwise_auc_loss(scores, failure_labels, valid_masks)
             pairwise_auc_loss = self.lambda_pairwise_auc * pairwise_auc_loss
+
+        prefix_pairwise_auc_loss = torch.tensor(0.0).to(scores)
+        if self.use_prefix_pairwise_auc and self.lambda_prefix_pairwise_auc > 0:
+            prefix_valid_masks = self._build_prefix_valid_masks(valid_masks)
+            prefix_pairwise_auc_loss = self._pairwise_auc_loss(
+                scores, failure_labels, prefix_valid_masks
+            )
+            prefix_pairwise_auc_loss = self.lambda_prefix_pairwise_auc * prefix_pairwise_auc_loss
         
-        monitor_loss += hard_neg_loss + pairwise_auc_loss
+        monitor_loss += hard_neg_loss + pairwise_auc_loss + prefix_pairwise_auc_loss
 
         # Log the losses
         logs = {
@@ -255,6 +287,7 @@ class TransModel(BaseModel):
             "fail_loss": fail_loss.item(),
             "hard_neg_loss": hard_neg_loss.item(),
             "pairwise_auc_loss": pairwise_auc_loss.item(),
+            "prefix_pairwise_auc_loss": prefix_pairwise_auc_loss.item(),
         }
         
         return monitor_loss, logs
