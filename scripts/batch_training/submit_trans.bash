@@ -75,7 +75,8 @@ run_pi0fast() {
 }
 
 run_openvla() {
-  # Overfitting-focused sweep for openvla_libero.
+  # Unseen-generalization-focused sweep for openvla_libero.
+  # Based on current best region: token_idx_rel=concat-2, lr~1e-5, lambda_reg~0.3.
   python -m failure_prob.train \
     --multirun \
     train.wandb_group_name=openvla_libero_v2 \
@@ -83,18 +84,18 @@ run_openvla() {
     train.roc_every=10 \
     dataset=openvla_libero_10 \
     dataset.data_path_prefix="${SAFE_OPENVLA_ROLLOUT_ROOT}" \
-    dataset.token_idx_rel=mean,concat-2 \
+    dataset.token_idx_rel=concat-2 \
     dataset.load_to_cuda=False \
     model=trans \
-    model.lr=1e-5,3e-5 \
-    model.dropout=0.3 \
-    model.lambda_reg=0.1,0.3 \
+    model.lr=1e-5,1.5e-5 \
+    model.dropout=0.3,0.4 \
+    model.lambda_reg=0.3,0.5 \
     model.use_time_weighting=True \
-    model.lambda_pairwise_auc=0.01 \
+    model.lambda_pairwise_auc=0.01,0.03 \
     model.pairwise_auc_beta=5.0 \
-    model.use_prefix_pairwise_auc=False \
+    model.use_prefix_pairwise_auc=True \
     model.lambda_prefix_pairwise_auc=0.01 \
-    model.prefix_pairwise_ratio=0.4 \
+    model.prefix_pairwise_ratio=0.5 \
     train.seed=0 \
     train.exp_suffix=trans
 }
