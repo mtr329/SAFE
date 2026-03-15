@@ -235,7 +235,7 @@ MODEL_NAME_ORDER = [
 
 def main(args: argparse.Namespace):
     
-    METRIC = METRIC_MAP[args.meta]
+    METRIC = args.metric if args.metric else METRIC_MAP[args.meta]
 
     if args.meta not in META_MAP.keys():
         raise ValueError(f"Invalid meta version: {args.meta}")
@@ -338,10 +338,17 @@ def main(args: argparse.Namespace):
                         
             # Get the best run for each combination of method and model.name
             compare_df = compare_df[compare_df["metric"] == METRIC]
+            if compare_df.empty:
+                print(f"[warn] metric '{METRIC}' not found for {group_names} {exp_suffixes}; skipping")
+                continue
             idx = compare_df.groupby(['model.name', 'method'])['val_seen'].idxmax()
             df_max = compare_df.loc[idx].reset_index(drop=True)
             benchmark_best.append(df_max)
         
+        if len(benchmark_best) == 0:
+            print(f"[warn] no rows found for benchmark {benchmark_name} with metric '{METRIC}'; skipping benchmark CSV.")
+            continue
+
         # Concatenate all the best runs
         benchmark_best = pd.concat(benchmark_best, ignore_index=True)
         
@@ -390,6 +397,12 @@ if __name__ == "__main__":
         type=str,
         default="log_trans_csv_2",
         help="Optional output directory for CSVs",
+    )
+    parser.add_argument(
+        "--metric",
+        type=str,
+        default=None,
+        help="Metric name used for best-run selection (e.g. mylog/earlymax_rocauc_d10).",
     )
     args = parser.parse_args()
     main(args)

@@ -35,52 +35,52 @@ python -m failure_prob.train \
     train.exp_suffix=mlp
 
 # The embed baseline
-# python -m failure_prob.train \
-#     --multirun \
-#     train.wandb_group_name=${GROUP_NAME} \
-#     dataset=pizero_fast \
-#     dataset.data_path_prefix=${SAFE_OPENPI_ROLLOUT_ROOT} \
-#     dataset.feat_name=pre_logits \
-#     dataset.token_idx_rel=mean \
-#     model=embed \
-#     model.n_epochs=1 \
-#     model.distance=cosine,euclid \
-#     model.use_success_only=False \
-#     model.topk=10 \
-#     model.cumsum=False \
-#     train.seed=0-1-2 \
-#     train.exp_suffix=embed
+python -m failure_prob.train \
+    --multirun \
+    train.wandb_group_name=${GROUP_NAME} \
+    dataset=pizero_fast \
+    dataset.data_path_prefix=${SAFE_OPENPI_ROLLOUT_ROOT} \
+    dataset.feat_name=pre_logits \
+    dataset.token_idx_rel=mean \
+    model=embed \
+    model.n_epochs=1 \
+    model.distance=cosine,euclid \
+    model.use_success_only=False \
+    model.topk=10 \
+    model.cumsum=False \
+    train.seed=0-1-2 \
+    train.exp_suffix=embed
 
-# python -m failure_prob.train \
-#     --multirun \
-#     train.wandb_group_name=${GROUP_NAME} \
-#     dataset=pizero_fast \
-#     dataset.data_path_prefix=${SAFE_OPENPI_ROLLOUT_ROOT} \
-#     dataset.feat_name=pre_logits \
-#     dataset.token_idx_rel=mean \
-#     model=embed \
-#     model.n_epochs=1 \
-#     model.distance=mahala \
-#     model.use_success_only=False \
-#     model.cumsum=False \
-#     train.seed=0-1-2 \
-#     train.exp_suffix=embed
+python -m failure_prob.train \
+    --multirun \
+    train.wandb_group_name=${GROUP_NAME} \
+    dataset=pizero_fast \
+    dataset.data_path_prefix=${SAFE_OPENPI_ROLLOUT_ROOT} \
+    dataset.feat_name=pre_logits \
+    dataset.token_idx_rel=mean \
+    model=embed \
+    model.n_epochs=1 \
+    model.distance=mahala \
+    model.use_success_only=False \
+    model.cumsum=False \
+    train.seed=0-1-2 \
+    train.exp_suffix=embed
 
-# python -m failure_prob.train \
-#     --multirun \
-#     train.wandb_group_name=${GROUP_NAME} \
-#     dataset=pizero_fast \
-#     dataset.data_path_prefix=${SAFE_OPENPI_ROLLOUT_ROOT} \
-#     dataset.feat_name=encoded \
-#     dataset.token_idx_rel=0.0 \
-#     model=embed \
-#     model.distance=pca_kmeans \
-#     model.pca_dim=32 \
-#     model.n_clusters=16 \
-#     model.use_success_only=False \
-#     model.cumsum=True \
-#     train.seed=0-1-2 \
-#     train.exp_suffix=embed
+python -m failure_prob.train \
+    --multirun \
+    train.wandb_group_name=${GROUP_NAME} \
+    dataset=pizero_fast \
+    dataset.data_path_prefix=${SAFE_OPENPI_ROLLOUT_ROOT} \
+    dataset.feat_name=encoded \
+    dataset.token_idx_rel=0.0 \
+    model=embed \
+    model.distance=pca_kmeans \
+    model.pca_dim=32 \
+    model.n_clusters=16 \
+    model.use_success_only=False \
+    model.cumsum=True \
+    train.seed=0-1-2 \
+    train.exp_suffix=embed
 
 # Chen's method
 # logpzo: cuda oom

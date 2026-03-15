@@ -73,7 +73,7 @@ def pull_metrics_from_group_v2(
         split_df[col] = split_df[col].astype(str)
     
     # Keep only the falert metrics
-    compare_df = split_df[split_df['metric'].str.contains("falert")]
+    compare_df = split_df[split_df['metric'].str.contains("falert|mylog")]
 
     # Split metric name into metric and method, move them to the front
     compare_df[['metric', 'method']] = compare_df['metric'].str.split('/', expand=True)
@@ -410,7 +410,7 @@ def pull_metrics_from_group_v2_local(
     for col in group_configs:
         split_df[col] = split_df[col].astype(str)
 
-    compare_df = split_df[split_df['metric'].str.contains("falert")]
+    compare_df = split_df[split_df['metric'].str.contains("falert|mylog")]
 
     compare_df[['metric', 'method']] = compare_df['metric'].str.split('/', expand=True)
     cols = compare_df.columns.tolist()

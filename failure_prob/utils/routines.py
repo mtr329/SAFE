@@ -78,7 +78,7 @@ def eval_metrics_and_log(
         }
         
         #### Evaluate ROC and PRC metrics at certain timesteps ####
-        metrics_logs = eval_scores_roc_prc(
+        metrics_logs, mylog = eval_scores_roc_prc(
             rollouts_by_split_name, 
             scores_by_split_name, 
             metric_name, 
@@ -87,6 +87,7 @@ def eval_metrics_and_log(
             plot_score_curves=True,
         )
         to_be_logged.update(metrics_logs)
+        to_be_logged.update(mylog)
         
         #### Evaluate the classification performance using different thresholding methods ####
         # Split Conformal Prediction: val_seen for calibration, val_unseen for testing
@@ -147,7 +148,7 @@ def eval_model_and_log(
         scores_by_split_name[split] = [scores[i, :int(seq_lengths[i])] for i in range(len(seq_lengths))]
 
     #### Evaluate ROC and PRC metrics at certain timesteps ####
-    roc_rpc_logs = eval_scores_roc_prc(
+    roc_rpc_logs, mylog = eval_scores_roc_prc(
         rollouts_by_split_name, 
         scores_by_split_name, 
         method_name,
@@ -156,6 +157,7 @@ def eval_model_and_log(
         plot_score_curves
     )
     to_be_logged.update(roc_rpc_logs)
+    to_be_logged.update(mylog)
     
     #### Evaluate the classification performance using different thresholding methods ####
     if log_classification_metrics:

@@ -118,6 +118,9 @@ def eval_scores_roc_prc(
     plot_score_curves: bool = True,
 ) -> list:
     to_be_logged = {}
+    my_log = {}
+    delay_deltas = [0, 10, 20, 30]
+    prefix_rs = [0, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100]
     
     # Log the failure scores by plot all the curves
     if plot_score_curves:
@@ -232,7 +235,62 @@ def eval_scores_roc_prc(
                 else:
                     to_be_logged[f'falert_end_prc_auc_taskwise/{method_name}_{split}_{task_id}'] = prc_auc
                     task_metrics["falert_end_prc_auc_taskwise"].append(prc_auc)
-                
+
+                # my metrics
+                if task_id == "all":
+                    def gen_delay(s, d):
+                        s = np.asarray(s)
+                        n = len(s)
+                        nd = int(round(float(d) * n))
+
+                        if nd <= 0:
+                            return s.copy()
+                        if nd >= n:
+                            return np.full_like(s, s[0])
+
+                        delayed = np.empty_like(s)
+                        delayed[:nd] = s[0]
+                        delayed[nd:] = s[:-nd]
+                        return delayed
+
+                    for d in delay_deltas:
+                        _d = d / 100.0
+                        scores_delay = [gen_delay(s, _d) for s in scores_task]
+
+                        def take_prefix_nonempty(s, frac):
+                            s = np.asarray(s)
+                            if len(s) == 0:
+                                return s
+                            n_pref = max(1, int(round(len(s) * frac)))
+                            return s[:n_pref]
+
+                        def seq_max(s):
+                            return float(np.max(s)) if len(s) > 0 else 0.0
+
+                        def seq_last(s):
+                            return float(s[-1]) if len(s) > 0 else 0.0
+
+                        for pref in prefix_rs:
+                            _pref = pref / 100.0
+                            s_early = [s[:r.task_min_step] for s, r in zip(scores_delay, rollouts_task)]
+                            s_early = [take_prefix_nonempty(s, _pref) for s in s_early]
+                            s_end = [take_prefix_nonempty(s, _pref) for s in scores_delay]
+                            scores_agg = {
+                                "earlymax": [seq_max(s) for s in s_early],
+                                "earlylast": [seq_last(s) for s in s_early],
+                                "endmax": [seq_max(s) for s in s_end],
+                                "endlast": [seq_last(s) for s in s_end]
+                            }
+                            
+                            for k, v in scores_agg.items():
+                                fpr, tpr, thresholds = roc_curve(labels_task, v)
+                                roc_auc = auc(fpr, tpr)
+                                pre, rec, thresholds = precision_recall_curve(labels_task, v)
+                                prc_auc = auc(rec, pre)
+                                # Keep mylog keys scalar-only and split-suffixed so export parser can read them.
+                                my_log[f"mylog/{k}_rocauc_d{d}_p{pref}_{split}"] = roc_auc
+                                my_log[f"mylog/{k}_prcauc_d{d}_p{pref}_{split}"] = prc_auc
+
         for key, values in task_metrics.items():
             to_be_logged[f"{key}/{method_name}_{split}"] = np.mean(values)
         
@@ -256,7 +314,7 @@ def eval_scores_roc_prc(
         plt.close(fig)
         
         
-    return to_be_logged
+    return to_be_logged, my_log
 
 
 def eval_binary_classification(
@@ -748,7 +806,4 @@ def eval_det_time_vs_classification(rollouts: list, scores: list[np.ndarray], la
         })
     
     return results
-
-
-
 

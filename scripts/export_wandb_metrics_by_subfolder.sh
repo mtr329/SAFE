@@ -21,6 +21,7 @@ SAVE_ROOT="log_trans_csv_by_subfolder"
 META="v2"
 DATASET_FILTER=""
 MODEL_FILTER=""
+METRIC=""
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -42,6 +43,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --meta)
       META="$2"
+      shift 2
+      ;;
+    --metric)
+      METRIC="$2"
       shift 2
       ;;
     -h|--help)
@@ -108,15 +113,30 @@ for dataset_dir in "$LOG_ROOT"/*; do
     mkdir -p "$out_dir"
 
     echo "[export] ${dataset_name}/${model_name} -> benchmark=${benchmark}"
-    if ! PYTHONPATH=. python scripts/get_wandb_metrics.py \
-      --meta "$META" \
-      --benchmark "$benchmark" \
-      --log_root "$model_dir" \
-      --save_root "$out_dir"; then
+    cmd=(python scripts/get_wandb_metrics.py
+      --meta "$META"
+      --benchmark "$benchmark"
+      --log_root "$model_dir"
+      --save_root "$out_dir")
+    if [[ -n "$METRIC" ]]; then
+      cmd+=(--metric "$METRIC")
+    fi
+
+    if ! env PYTHONPATH=. "${cmd[@]}"; then
       echo "[warn] export failed for ${dataset_name}/${model_name}, continue..."
       failed=$((failed + 1))
       failed_items+=("${dataset_name}/${model_name}")
       continue
+    fi
+
+    if [[ -n "$METRIC" ]]; then
+      benchmark_csv="$out_dir/${benchmark}.csv"
+      if [[ -f "$benchmark_csv" ]]; then
+        echo "[metric] ${dataset_name}/${model_name} metric=${METRIC}"
+        python -c "import pandas as pd; p='$benchmark_csv'; df=pd.read_csv(p); cols=['method','model.name','val_seen']; print(df[cols].to_string(index=False))"
+      else
+        echo "[metric] ${dataset_name}/${model_name}: benchmark csv not found for metric print"
+      fi
     fi
 
     exported=1
