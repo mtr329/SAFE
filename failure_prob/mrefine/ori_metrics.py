@@ -5,6 +5,7 @@ import warnings
 import numpy as np
 import os
 import json
+import pandas as pd
 from omegaconf import OmegaConf
 from matplotlib.figure import Figure
 
@@ -125,19 +126,19 @@ def _get_calib_res(
     test_scores_all = np.array(test_scores_all) # (N, T)
     n_test_samples = len(test_scores_all)
 
-    for eval_time in ["last", "early"]:
-        calib_dict.setdefault(eval_time, {})
+    for eval_time_mode in ["last", "early"]:
+        calib_dict.setdefault(eval_time_mode, {})
 
         for alpha in alphas:
-            calib_dict[eval_time].setdefault(f"{alpha}", {})
+            calib_dict[eval_time_mode].setdefault(f"{alpha}", {})
 
             cp_band = cp_bands_by_alpha[alpha]
             if lower_bound: detection_mask = test_scores_all <= cp_band # (N, T)
             else:           detection_mask = test_scores_all >= cp_band # (N, T)
 
-            if eval_time == "last":
+            if eval_time_mode == "last":
                 lengths = test_scores_all.shape[1] # scalar, T
-            elif eval_time == "early":
+            elif eval_time_mode == "early":
                 lengths = test_earliest_stop # (N,)
                 # After the earliest stop, no more detection is possible. 
                 for i in range(len(test_scores_all)):
@@ -167,7 +168,7 @@ def _get_calib_res(
                 f1 = 2 * tp / (2 * tp + fp + fn) if (2 * tp + fp + fn) > 0 else 0.0
                 bal_acc = (tpr + tnr) / 2
             
-            alpha_dict = calib_dict[eval_time][f"{alpha}"]
+            alpha_dict = calib_dict[eval_time_mode][f"{alpha}"]
             alpha_dict.setdefault("detect_method", method_name)
             for m in ["avg_det_time", "tpr", "tnr", "fpr", "fnr", "acc", "bal_acc", "f1"]:
                 alpha_dict.setdefault(m, [])
@@ -269,6 +270,26 @@ def _summarize_method_runs(runs_dict: dict[str, dict]) -> dict:
         }
         for split, metrics in summary_acc.items()
     }
+
+
+def _ori_summary_to_df(ori_summary: dict) -> pd.DataFrame:
+    rows = []
+    for method_name, split_metrics in ori_summary.items():
+        for split_name, metrics in split_metrics.items():
+            row = {
+                "method": method_name,
+                "split": split_name,
+            }
+            row.update(metrics)
+            rows.append(row)
+
+    if not rows:
+        return pd.DataFrame(columns=["method", "split", "roc_auc", "prc_auc"])
+
+    df = pd.DataFrame(rows)
+    front_cols = [col for col in ["method", "split", "roc_auc", "prc_auc"] if col in df.columns]
+    other_cols = [col for col in df.columns if col not in front_cols]
+    return df[front_cols + other_cols]
 
 
 def _get_ori_figs(
@@ -470,9 +491,12 @@ def summar_ori_metrics(
     with open(save_path, "w") as f:
         json.dump(ori_summary, f, indent=2)
 
+    csv_save_path = os.path.join(ori_save_dir, "ori_summary.csv")
+    _ori_summary_to_df(ori_summary).to_csv(csv_save_path, index=False)
+
     ori_figs = _get_ori_figs(ori_logs_by_method)
     for eval_time, fig in ori_figs.items():
-        fig.savefig(os.path.join(ori_save_dir, f"{eval_time}.png"))
+        fig.savefig(os.path.join(ori_save_dir, f"{eval_time}.png"), dpi=400)
 
     return ori_summary, ori_figs
 

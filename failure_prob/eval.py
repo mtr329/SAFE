@@ -38,6 +38,7 @@ from failure_prob.mrefine.ori_metrics import (
     get_ori_metrics,
     summar_ori_metrics,
 )
+from failure_prob.mrefine.delay_metrics import get_delay_metrics
 
 
 def parse_seeds(seed_cfg: str | int) -> list[int]:
@@ -310,6 +311,16 @@ def evaluate_cfg(cfg: Config) -> None:
                 method_name,
                 my_logs["ori"],
             )
+
+            # delay metrics
+            my_logs.setdefault("delay", {})
+            get_delay_metrics(
+                scores_by_split_name,
+                rollouts_by_split_name,
+                method_name,
+                my_logs["delay"]
+            )
+
         
     if my_logs_save_dir is None:
         my_logs_save_dir = resolve_eval_output_dir(cfg.train.eval_ckpt_path)
