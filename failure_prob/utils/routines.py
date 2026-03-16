@@ -87,7 +87,7 @@ def eval_metrics_and_log(
             plot_score_curves=True,
         )
         to_be_logged.update(metrics_logs)
-        to_be_logged.update(mylog)
+        # to_be_logged.update(mylog)
         
         #### Evaluate the classification performance using different thresholding methods ####
         # Split Conformal Prediction: val_seen for calibration, val_unseen for testing
@@ -157,7 +157,7 @@ def eval_model_and_log(
         plot_score_curves
     )
     to_be_logged.update(roc_rpc_logs)
-    to_be_logged.update(mylog)
+    # to_be_logged.update(mylog)
     
     #### Evaluate the classification performance using different thresholding methods ####
     if log_classification_metrics:

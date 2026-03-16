@@ -136,6 +136,22 @@ def compute_sample_unc_metrics(
     '''
     T, b, t, A = sampled_actions.shape
     X = sampled_actions.reshape(T, b, -1) # (T, b, t * A)
+
+    if b < 2:
+        # With fewer than two samples, sample variance and cluster entropy are
+        # undefined. Treat the predictive uncertainty as zero instead of
+        # crashing during handcrafted-metric precomputation.
+        zeros = sampled_actions.new_zeros(T)
+        metrics = {
+            "total_var": zeros.clone(),
+            "general_var": zeros.clone(),
+            "pos_var": zeros.clone(),
+            "rot_var": zeros.clone(),
+            "gripper_var": zeros.clone(),
+        }
+        for threshold in [0.01, 0.05, 0.1, 0.2, 0.5, 1.0, 2.0, 5.0]:
+            metrics[f"entropy_linkage{threshold}"] = zeros.clone()
+        return metrics
     
     # Compute the covariance matrix for each timestep. The resulting matrix should be of shape (T, t*A, t*A)
     X_centered = X - X.mean(dim=1, keepdim=True)  # (T, b, t * A)

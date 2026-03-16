@@ -1,5 +1,7 @@
 #!/bin/bash
 
+set -euo pipefail
+
 # Run all experiments for Pi0-FAST model on the LIBERO rollouts
 
 GROUP_NAME=pi0fast_libero_v4
@@ -83,36 +85,53 @@ python -m failure_prob.train \
     train.exp_suffix=embed
 
 # Chen's method
-# logpzo: cuda oom
+# logpzo: cuda oom, use batch_size=24
 # for MODEL in rnd logpzo; do
-# for MODEL in logpzo; do
-# for FEAT in pre_logits; do
-#     python -m failure_prob.train \
-#         --multirun \
-#         train.wandb_group_name=${GROUP_NAME} \
-#         dataset=pizero_fast \
-#         dataset.data_path_prefix=${SAFE_OPENPI_ROLLOUT_ROOT} \
-#         dataset.feat_name=${FEAT} \
-#         dataset.token_idx_rel=mean \
-#         model=${MODEL} \
-#         model.use_success_only=False \
-#         model.batch_size=32 \
-#         train.roc_every=50 \
-#         train.seed=0-1-2 \
-#         train.exp_suffix=chen
-# done
-# done
+for MODEL in rnd; do
+for FEAT in pre_logits; do
+    python -m failure_prob.train \
+        --multirun \
+        train.wandb_group_name=${GROUP_NAME} \
+        dataset=pizero_fast \
+        dataset.data_path_prefix=${SAFE_OPENPI_ROLLOUT_ROOT} \
+        dataset.feat_name=${FEAT} \
+        dataset.token_idx_rel=mean \
+        model=${MODEL} \
+        model.use_success_only=False \
+        model.batch_size=32 \
+        train.roc_every=50 \
+        train.seed=0-1-2 \
+        train.exp_suffix=chen
+done
+done
 
-# # The hand-crafted baselines
-# error
-# python -m failure_prob.train \
-#     --multirun \
-#     train.wandb_group_name=${GROUP_NAME} \
-#     dataset=pizero_fast \
-#     dataset.data_path_prefix=${SAFE_OPENPI_ROLLOUT_ROOT} \
-#     train.log_precomputed_only=True \
-#     train.seed=0-1-2 \
-#     train.exp_suffix=handcrafted
+for MODEL in logpzo; do
+for FEAT in pre_logits; do
+    python -m failure_prob.train \
+        --multirun \
+        train.wandb_group_name=${GROUP_NAME} \
+        dataset=pizero_fast \
+        dataset.data_path_prefix=${SAFE_OPENPI_ROLLOUT_ROOT} \
+        dataset.feat_name=${FEAT} \
+        dataset.token_idx_rel=mean \
+        model=${MODEL} \
+        model.use_success_only=False \
+        model.batch_size=24 \
+        train.roc_every=50 \
+        train.seed=0-1-2 \
+        train.exp_suffix=chen
+done
+done
+
+# The hand-crafted baselines
+python -m failure_prob.train \
+    --multirun \
+    train.wandb_group_name=${GROUP_NAME} \
+    dataset=pizero_fast \
+    dataset.data_path_prefix=${SAFE_OPENPI_ROLLOUT_ROOT} \
+    train.log_precomputed_only=True \
+    train.seed=0-1-2 \
+    train.exp_suffix=handcrafted
 
 
 # # Handcreafted baselines with multiple action samples
@@ -124,4 +143,3 @@ python -m failure_prob.train \
 #     train.log_precomputed_only=True \
 #     train.seed=0-1-2 \
 #     train.exp_suffix=handcrafted_multi
-

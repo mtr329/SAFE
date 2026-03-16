@@ -1,4 +1,4 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Optional
 from omegaconf import MISSING, OmegaConf
 import hydra
@@ -299,7 +299,9 @@ class TrainConfig:
     eval_save_video_multiproc: bool = True
     eval_save_timing_plots: bool = False
     eval_save_logs: bool = False
-    eval_save_ckpt: bool = False
+    eval_save_ckpt: bool = True
+    eval_ckpt_path: Optional[str] = None
+    eval_split_path: Optional[str] = None
     logs_save_root: str = "./logs/"
     logs_save_path: str = MISSING
     eval_cp_alpha: float = 0.2
@@ -316,7 +318,7 @@ class Config:
     # These fields are required and will be provided by Hydra’s config groups.
     dataset: DatasetConfig = MISSING
     model: ModelConfig = MISSING
-    train: TrainConfig = TrainConfig()
+    train: TrainConfig = field(default_factory=TrainConfig)
 
 #########################
 # Register with ConfigStore

@@ -233,6 +233,45 @@ MODEL_NAME_ORDER = [
     "indep",
 ]
 
+
+def _collect_wandb_runs(row: pd.Series) -> tuple[str, str]:
+    run_ids = []
+    run_refs = []
+    seen_ids = set()
+    seen_refs = set()
+
+    for col, value in row.items():
+        if pd.isna(value):
+            continue
+        if not isinstance(col, str):
+            continue
+        if col.startswith("avg-") or col.startswith("avg_mstd-"):
+            continue
+
+        if col == "_id":
+            prefix = ""
+        elif col.endswith("-_id"):
+            prefix = col[: -len("-_id")]
+        else:
+            continue
+
+        run_id = str(value)
+        if run_id not in seen_ids:
+            seen_ids.add(run_id)
+            run_ids.append(run_id)
+
+        project_col = "_project" if prefix == "" else f"{prefix}-_project"
+        project = row.get(project_col, "")
+        if pd.isna(project):
+            project = ""
+        run_ref = f"{project}/{run_id}" if project else run_id
+        if run_ref not in seen_refs:
+            seen_refs.add(run_ref)
+            run_refs.append(run_ref)
+
+    return ",".join(run_ids), ",".join(run_refs)
+
+
 def main(args: argparse.Namespace):
     
     METRIC = args.metric if args.metric else METRIC_MAP[args.meta]
@@ -271,7 +310,12 @@ def main(args: argparse.Namespace):
             }
             
             compare_df = pull_metrics_from_group_v2_local(
-                args.log_root, group_names, ablated_configs, group_configs, filters
+                args.log_root,
+                group_names,
+                ablated_configs,
+                group_configs,
+                filters,
+                return_wandb_info=True,
             )
 
             if compare_df.empty:
@@ -343,6 +387,9 @@ def main(args: argparse.Namespace):
                 continue
             idx = compare_df.groupby(['model.name', 'method'])['val_seen'].idxmax()
             df_max = compare_df.loc[idx].reset_index(drop=True)
+            run_info = df_max.apply(_collect_wandb_runs, axis=1, result_type="expand")
+            run_info.columns = ["wandb_run_ids", "wandb_runs"]
+            df_max = pd.concat([df_max, run_info], axis=1)
             benchmark_best.append(df_max)
         
         if len(benchmark_best) == 0:
@@ -360,6 +407,11 @@ def main(args: argparse.Namespace):
         cols.insert(2, cols.pop(cols.index('train')))
         cols.insert(3, cols.pop(cols.index('val_seen')))
         cols.insert(4, cols.pop(cols.index('val_unseen')))
+        if 'wandb_runs' in cols:
+            cols.insert(5, cols.pop(cols.index('wandb_runs')))
+        if 'wandb_run_ids' in cols:
+            insert_idx = 6 if 'wandb_runs' in benchmark_best.columns else 5
+            cols.insert(insert_idx, cols.pop(cols.index('wandb_run_ids')))
         benchmark_best = benchmark_best[cols]
         
         # Sort the dataframe by model.name, according to the order in MODEL_NAME_ORDER

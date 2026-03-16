@@ -161,7 +161,7 @@ def load_rollouts(cfg: Config) -> list[Rollout]:
 
 def split_rollouts(cfg: Config, all_rollouts: list[Rollout]) -> dict[str, list[Rollout]]:
     # Split rollouts into seen and unseen tasks
-    task_ids = list(set([r.task_id for r in all_rollouts]))
+    task_ids = sorted(set(r.task_id for r in all_rollouts))
     n_unseen = round(cfg.dataset.unseen_task_ratio * len(task_ids))
     n_seen = len(task_ids) - n_unseen
     

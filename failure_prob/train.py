@@ -25,6 +25,7 @@ from failure_prob.utils.routines import (
 )
 from failure_prob.utils.video import eval_save_videos, eval_save_videos_functional_cp
 from failure_prob.utils.random import seed_everything
+from failure_prob.utils.split_io import save_split_signature
 
 from failure_prob.conf import Config, process_cfg
 
@@ -90,6 +91,16 @@ def main(cfg: Config) -> None:
         )
         
         rollouts_by_split_name = split_rollouts(cfg, all_rollouts)
+        split_save_path = os.path.join(
+            cfg.train.logs_save_path,
+            f"split_seed{seed}.json",
+        )
+        split_signature = save_split_signature(split_save_path, rollouts_by_split_name)
+        print(
+            "Saving split signature to",
+            os.path.abspath(split_save_path),
+            f"(md5={split_signature['split_md5']})",
+        )
         
         train_rollouts = rollouts_by_split_name["train"]
         input_dim = train_rollouts[0].hidden_states.shape[-1]
@@ -199,7 +210,10 @@ def main(cfg: Config) -> None:
                 
         if cfg.train.eval_save_ckpt:
             os.makedirs(cfg.train.logs_save_path, exist_ok=True)
-            ckpt_save_path = os.path.join(cfg.train.logs_save_path, "model_final.ckpt")
+            ckpt_save_path = os.path.join(
+                cfg.train.logs_save_path,
+                f"model_seed{seed}.ckpt",
+            )
             print("Saving model checkpoint to", os.path.abspath(ckpt_save_path))
             torch.save(model.state_dict(), ckpt_save_path)
         
