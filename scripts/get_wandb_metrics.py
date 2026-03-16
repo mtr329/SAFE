@@ -4,6 +4,7 @@ import os
 import pandas as pd
 
 from failure_prob.utils.wandb import (
+    load_local_runs_df,
     pull_metrics_from_group_v2_local,
 )
 
@@ -272,6 +273,26 @@ def _collect_wandb_runs(row: pd.Series) -> tuple[str, str]:
     return ",".join(run_ids), ",".join(run_refs)
 
 
+def infer_benchmark_names(meta: dict, log_root: str) -> list[str]:
+    runs_df = load_local_runs_df(log_root)
+    if runs_df.empty:
+        raise ValueError(f"No local W&B runs found under: {log_root}")
+    if "group" not in runs_df.columns:
+        raise ValueError(f"Column 'group' not found in local runs under: {log_root}")
+
+    groups = sorted({str(v) for v in runs_df["group"].dropna().unique()})
+    if not groups:
+        raise ValueError(f"No W&B group names found under: {log_root}")
+
+    benchmark_names = [name for name in meta.keys() if name in groups]
+    if not benchmark_names:
+        raise ValueError(
+            f"Could not infer benchmark from groups {groups} under {log_root}. "
+            f"Known benchmarks: {sorted(meta.keys())}"
+        )
+    return benchmark_names
+
+
 def main(args: argparse.Namespace):
     
     METRIC = args.metric if args.metric else METRIC_MAP[args.meta]
@@ -286,6 +307,8 @@ def main(args: argparse.Namespace):
     
     if args.benchmark == "all":
         benchmark_names = list(WANDB_META.keys())
+    elif args.benchmark == "auto":
+        benchmark_names = infer_benchmark_names(WANDB_META, args.log_root)
     else:
         assert args.benchmark in WANDB_META.keys(), f"Invalid benchmark name: {args.benchmark}"
         benchmark_names = [args.benchmark]
@@ -437,7 +460,12 @@ def main(args: argparse.Namespace):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--meta", type=str, default="v2", help="The meta version to use")
-    parser.add_argument("--benchmark", type=str, default="all", help="The benchmark to process")
+    parser.add_argument(
+        "--benchmark",
+        type=str,
+        default="all",
+        help="The benchmark to process. Use 'auto' to infer it from local run group names.",
+    )
     parser.add_argument(
         "--log_root",
         type=str,

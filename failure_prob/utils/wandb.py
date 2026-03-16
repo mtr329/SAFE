@@ -313,6 +313,22 @@ def _parse_local_run_id(run_dir_name: str) -> str:
     return parts[-1] if len(parts) >= 3 else run_dir_name
 
 
+def _iter_local_run_dirs(log_root: str) -> list[Path]:
+    root = Path(log_root)
+    if not root.exists():
+        raise FileNotFoundError(f"log_root not found: {log_root}")
+    if not root.is_dir():
+        raise ValueError(f"log_root must be a directory: {log_root}")
+
+    run_dirs: list[Path] = []
+    if root.name.startswith("run-"):
+        run_dirs.append(root)
+    else:
+        run_dirs.extend(sorted(p for p in root.rglob("run-*") if p.is_dir()))
+
+    return run_dirs
+
+
 def _apply_local_filters(df: pd.DataFrame, filters: dict | None) -> pd.DataFrame:
     if not filters:
         return df
@@ -341,11 +357,9 @@ def load_local_runs_df(log_root: str, filters: dict | None = None) -> pd.DataFra
         raise ImportError("PyYAML is required to parse local W&B config.yaml")
 
     log_root = os.path.abspath(log_root)
-    if not os.path.isdir(log_root):
-        raise FileNotFoundError(f"log_root not found: {log_root}")
-
     rows = []
-    for run_dir in sorted(Path(log_root).glob("run-*/")):
+    run_dirs = _iter_local_run_dirs(log_root)
+    for run_dir in run_dirs:
         files_dir = run_dir / "files"
         summary_path = files_dir / "wandb-summary.json"
         config_path = files_dir / "config.yaml"

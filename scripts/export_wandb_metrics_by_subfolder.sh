@@ -10,11 +10,11 @@ set -euo pipefail
 #     --meta v2
 #
 # Expected log structure:
-#   log_wandb/<dataset>/<model>/run-*
+#   log_wandb/<dataset>/<subfolder>/wandb/run-*
 # Example:
-#   log_wandb/pi0fast_libero/trans_best_0/run-...
-#   log_wandb/openvla/ref/run-...
-#   log_wandb/pi0_libero/trans0/run-...
+#   log_wandb/pizero_fast/indep/wandb/run-...
+#   log_wandb/pizero_fast/embed_cosine/wandb/run-...
+#   log_wandb/openvla/lstm/wandb/run-...
 
 LOG_ROOT="log_wandb"
 SAVE_ROOT="log_trans_csv_by_subfolder"
@@ -67,19 +67,6 @@ fi
 
 mkdir -p "$SAVE_ROOT"
 
-# Map log_wandb dataset folder -> benchmark key in scripts/get_wandb_metrics.py
-benchmark_from_dataset() {
-  case "$1" in
-    pi0fast_libero) echo "pi0fast_libero_v4" ;;
-    pi0_libero) echo "pi0diff_libero_v1" ;;
-    openvla) echo "openvla_libero_v2" ;;
-    opi0_simpler) echo "opi0_simpler_v1" ;;
-    *)
-      return 1
-      ;;
-  esac
-}
-
 exported=0
 failed=0
 failed_items=()
@@ -91,11 +78,6 @@ for dataset_dir in "$LOG_ROOT"/*; do
     continue
   fi
 
-  if ! benchmark="$(benchmark_from_dataset "$dataset_name")"; then
-    echo "[skip] $dataset_name: no benchmark mapping"
-    continue
-  fi
-
   for model_dir in "$dataset_dir"/*; do
     [[ -d "$model_dir" ]] || continue
     model_name="$(basename "$model_dir")"
@@ -104,25 +86,25 @@ for dataset_dir in "$LOG_ROOT"/*; do
       continue
     fi
 
-    if ! find "$model_dir" -maxdepth 1 -type d -name "run-*" | grep -q .; then
-      echo "[skip] ${dataset_name}/${model_name}: no run-* folders"
+    if ! find "$model_dir" -type d -name "run-*" | grep -q .; then
+      echo "[skip] ${dataset_name}/${model_name}: no run-* folders under subdirectory"
       continue
     fi
 
     out_dir="$SAVE_ROOT/$dataset_name/$model_name"
     mkdir -p "$out_dir"
 
-    echo "[export] ${dataset_name}/${model_name} -> benchmark=${benchmark}"
+    echo "[export] ${dataset_name}/${model_name} -> benchmark=auto"
     cmd=(python scripts/get_wandb_metrics.py
       --meta "$META"
-      --benchmark "$benchmark"
+      --benchmark auto
       --log_root "$model_dir"
       --save_root "$out_dir")
     if [[ -n "$METRIC" ]]; then
       cmd+=(--metric "$METRIC")
     fi
 
-    if ! env PYTHONPATH=. "${cmd[@]}"; then
+    if ! env WANDB_MODE=offline PYTHONPATH=. "${cmd[@]}"; then
       echo "[warn] export failed for ${dataset_name}/${model_name}, continue..."
       failed=$((failed + 1))
       failed_items+=("${dataset_name}/${model_name}")
@@ -130,11 +112,18 @@ for dataset_dir in "$LOG_ROOT"/*; do
     fi
 
     if [[ -n "$METRIC" ]]; then
-      benchmark_csv="$out_dir/${benchmark}.csv"
-      if [[ -f "$benchmark_csv" ]]; then
-        echo "[metric] ${dataset_name}/${model_name} metric=${METRIC}"
-        python -c "import pandas as pd; p='$benchmark_csv'; df=pd.read_csv(p); cols=['method','model.name','val_seen']; print(df[cols].to_string(index=False))"
-      else
+      metric_printed=0
+      for benchmark_csv in "$out_dir"/*.csv; do
+        [[ -f "$benchmark_csv" ]] || continue
+        benchmark_base="$(basename "$benchmark_csv")"
+        if [[ "$benchmark_base" == *-* ]]; then
+          continue
+        fi
+        echo "[metric] ${dataset_name}/${model_name} metric=${METRIC} csv=${benchmark_base}"
+        python -c "import pandas as pd; p='$benchmark_csv'; df=pd.read_csv(p); cols=['method','model.name','val_seen']; keep=[c for c in cols if c in df.columns]; print(df[keep].to_string(index=False))"
+        metric_printed=1
+      done
+      if [[ "$metric_printed" -eq 0 ]]; then
         echo "[metric] ${dataset_name}/${model_name}: benchmark csv not found for metric print"
       fi
     fi

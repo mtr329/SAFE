@@ -215,7 +215,13 @@ def main(cfg: Config) -> None:
                 f"model_seed{seed}.ckpt",
             )
             print("Saving model checkpoint to", os.path.abspath(ckpt_save_path))
-            torch.save(model.state_dict(), ckpt_save_path)
+            torch.save(
+                {
+                    "state_dict": model.state_dict(),
+                    "epoch": n_epochs,
+                },
+                ckpt_save_path,
+            )
         
         wandb.finish(quiet=True)
         

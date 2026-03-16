@@ -7,11 +7,13 @@ set -euo pipefail
 GROUP_NAME=pi0fast_libero_v4
 export CUDA_VISIBLE_DEVICES=3
 SAFE_OPENPI_ROLLOUT_ROOT=/data1/mtr/data/safe_rollouts/
+WANDB_DIR=./wandb
 
 # LSTM
 python -m failure_prob.train \
     --multirun \
     train.wandb_group_name=${GROUP_NAME} \
+    train.wandb_dir=${WANDB_DIR}/pizero_fast/lstm \
     dataset=pizero_fast \
     dataset.data_path_prefix=${SAFE_OPENPI_ROLLOUT_ROOT} \
     dataset.feat_name=encoded \
@@ -26,6 +28,7 @@ python -m failure_prob.train \
 python -m failure_prob.train \
     --multirun \
     train.wandb_group_name=${GROUP_NAME} \
+    train.wandb_dir=${WANDB_DIR}/pizero_fast/indep \
     dataset=pizero_fast \
     dataset.data_path_prefix=${SAFE_OPENPI_ROLLOUT_ROOT} \
     dataset.feat_name=pre_logits \
@@ -40,6 +43,7 @@ python -m failure_prob.train \
 python -m failure_prob.train \
     --multirun \
     train.wandb_group_name=${GROUP_NAME} \
+    train.wandb_dir=${WANDB_DIR}/pizero_fast/embed_\${model.distance} \
     dataset=pizero_fast \
     dataset.data_path_prefix=${SAFE_OPENPI_ROLLOUT_ROOT} \
     dataset.feat_name=pre_logits \
@@ -56,6 +60,7 @@ python -m failure_prob.train \
 python -m failure_prob.train \
     --multirun \
     train.wandb_group_name=${GROUP_NAME} \
+    train.wandb_dir=${WANDB_DIR}/pizero_fast/embed_\${model.distance} \
     dataset=pizero_fast \
     dataset.data_path_prefix=${SAFE_OPENPI_ROLLOUT_ROOT} \
     dataset.feat_name=pre_logits \
@@ -71,6 +76,7 @@ python -m failure_prob.train \
 python -m failure_prob.train \
     --multirun \
     train.wandb_group_name=${GROUP_NAME} \
+    train.wandb_dir=${WANDB_DIR}/pizero_fast/embed_\${model.distance} \
     dataset=pizero_fast \
     dataset.data_path_prefix=${SAFE_OPENPI_ROLLOUT_ROOT} \
     dataset.feat_name=encoded \
@@ -92,6 +98,7 @@ for FEAT in pre_logits; do
     python -m failure_prob.train \
         --multirun \
         train.wandb_group_name=${GROUP_NAME} \
+        train.wandb_dir=${WANDB_DIR}/pizero_fast/${MODEL} \
         dataset=pizero_fast \
         dataset.data_path_prefix=${SAFE_OPENPI_ROLLOUT_ROOT} \
         dataset.feat_name=${FEAT} \
@@ -110,6 +117,7 @@ for FEAT in pre_logits; do
     python -m failure_prob.train \
         --multirun \
         train.wandb_group_name=${GROUP_NAME} \
+        train.wandb_dir=${WANDB_DIR}/pizero_fast/${MODEL} \
         dataset=pizero_fast \
         dataset.data_path_prefix=${SAFE_OPENPI_ROLLOUT_ROOT} \
         dataset.feat_name=${FEAT} \
@@ -127,6 +135,7 @@ done
 python -m failure_prob.train \
     --multirun \
     train.wandb_group_name=${GROUP_NAME} \
+    train.wandb_dir=${WANDB_DIR}/pizero_fast/handcrafted \
     dataset=pizero_fast \
     dataset.data_path_prefix=${SAFE_OPENPI_ROLLOUT_ROOT} \
     train.log_precomputed_only=True \

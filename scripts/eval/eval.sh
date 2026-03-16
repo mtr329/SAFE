@@ -6,11 +6,13 @@ set -euo pipefail
 #
 # Usage:
 #   scripts/eval/eval.sh
-#   scripts/eval/eval.sh logs/pizero_fast-default-lstm-lstm/20260315/160125
-#   scripts/eval/eval.sh logs/pizero_fast-default-lstm-lstm
+#   EVAL_LOGS_DIR=log_ckpt scripts/eval/eval.sh
+#   scripts/eval/eval.sh log_ckpt/pizero_fast-default-lstm-lstm/20260315/160125
+#   scripts/eval/eval.sh log_ckpt/pizero_fast-default-lstm-lstm
 #
 # Default behavior:
-#   Traverse logs/<method>/<date>/<run> and evaluate each run directory.
+#   Traverse log_ckpt/<method>/<date>/<run> or logs/<method>/<date>/<run>
+#   and evaluate each run directory.
 #
 # Optional argument:
 #   Restrict evaluation to the specified directory. If the directory itself
@@ -18,6 +20,23 @@ set -euo pipefail
 #   directories containing config.yaml are evaluated.
 
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-3}"
+
+resolve_default_logs_dir() {
+    if [ -n "${EVAL_LOGS_DIR:-}" ]; then
+        printf '%s\n' "${EVAL_LOGS_DIR}"
+        return
+    fi
+
+    for candidate in log_ckpt logs; do
+        if [ -d "${candidate}" ]; then
+            printf '%s\n' "${candidate}"
+            return
+        fi
+    done
+
+    echo "Could not find a default logs directory. Tried: log_ckpt, logs" >&2
+    exit 1
+}
 
 run_eval() {
     local log_dir="$1"
@@ -72,7 +91,7 @@ fi
 if [ "$#" -eq 1 ]; then
     target_root="$(realpath "$1")"
 else
-    target_root="$(realpath logs)"
+    target_root="$(realpath "$(resolve_default_logs_dir)")"
 fi
 
 mapfile -t target_dirs < <(collect_target_dirs "${target_root}")

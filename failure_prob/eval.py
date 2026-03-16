@@ -35,7 +35,8 @@ from failure_prob.utils.routines import (
 from failure_prob.conf import Config, process_cfg
 
 from failure_prob.mrefine.ori_metrics import (
-    get_ori_metrics
+    get_ori_metrics,
+    summar_ori_metrics,
 )
 
 
@@ -89,11 +90,12 @@ def resolve_split_path(
     return None
 
 
-def load_model_checkpoint(model: BaseModel, ckpt_path: str) -> BaseModel:
+def load_model_checkpoint(model: BaseModel, ckpt_path: str) -> tuple[BaseModel, int | None]:
     checkpoint = torch.load(ckpt_path, map_location="cpu")
+    loaded_epoch = checkpoint.get("epoch") if isinstance(checkpoint, dict) else None
     state_dict = checkpoint["state_dict"] if isinstance(checkpoint, dict) and "state_dict" in checkpoint else checkpoint
     model.load_state_dict(state_dict)
-    return model
+    return model, loaded_epoch
 
 
 def collect_scalar_logs(logs: dict) -> dict[str, float]:
@@ -162,6 +164,19 @@ def run_batch_eval(target_root: Path) -> None:
         cfg.train.eval_ckpt_path = str(log_dir)
         cfg.dataset.data_path_prefix = ""
         evaluate_cfg(cfg)
+
+
+def resolve_default_debug_run_dir(repo_root: Path) -> Path:
+    for root_name in ("log_ckpt", "logs"):
+        root_dir = repo_root / root_name
+        if not root_dir.exists():
+            continue
+
+        config_dirs = sorted({p.parent.resolve() for p in root_dir.rglob("config.yaml")})
+        if config_dirs:
+            return config_dirs[0]
+
+    return repo_root / "log_ckpt"
 
 
 def evaluate_cfg(cfg: Config) -> None:
@@ -249,8 +264,13 @@ def evaluate_cfg(cfg: Config) -> None:
             input_dim = rollouts_by_split_name["train"][0].hidden_states.shape[-1]
             model: BaseModel = get_model(cfg, input_dim)
             print("Loading checkpoint from", os.path.abspath(ckpt_path))
-            model = load_model_checkpoint(model, ckpt_path)
+            model, loaded_epoch = load_model_checkpoint(model, ckpt_path)
+            if loaded_epoch is not None:
+                print(f"Loaded checkpoint epoch: {loaded_epoch}")
             model.to("cuda")
+            if cfg.model.name == "embed" and not getattr(model, "trained", True):
+                print("Rebuilding embed state from the training split for evaluation")
+                model.train_epoch(None, dataloader_by_split_name["train"], force_retrain=True)
             model.eval()
             
             #### Forward the model and compute the scores ####
@@ -273,6 +293,7 @@ def evaluate_cfg(cfg: Config) -> None:
                 my_logs["ori"],
             )
 
+
     if my_logs_save_dir is None:
         my_logs_save_dir = resolve_eval_output_dir(cfg.train.eval_ckpt_path)
     my_logs_save_dir = os.path.join(my_logs_save_dir, "eval")
@@ -290,7 +311,7 @@ def main(cfg: Config) -> None:
 
 if __name__ == "__main__":
     repo_root = Path(__file__).resolve().parents[1]
-    debug_run_dir = repo_root / "logs/pizero_fast-default-embed-embed/20260315/160704"
+    debug_run_dir = resolve_default_debug_run_dir(repo_root)
     if len(sys.argv) == 1:
         sys.argv.extend([
             "--config-path",

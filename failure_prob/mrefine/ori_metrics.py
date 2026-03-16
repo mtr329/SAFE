@@ -1,7 +1,12 @@
+import argparse
 from sklearn.metrics import roc_curve, auc, precision_recall_curve
 from sklearn.metrics import roc_auc_score, average_precision_score
 import warnings
 import numpy as np
+import os
+import json
+from omegaconf import OmegaConf
+from matplotlib.figure import Figure
 
 from failure_prob.utils.conformal.functional_predictor import (
     RegressionType,
@@ -44,15 +49,14 @@ def _get_ori_static_metrics(
                 prc_auc = auc(rec, pre)
 
                 task_dict = static_dict[split][f"{task_id}"]
-                for key in ["fpr", "tpr", "roc_auc", "pre", "rec", "prc_auc"]:
-                    task_dict.setdefault(key, {})
-                    task_dict[key].setdefault(f"{task_id}", [])
-                # task_dict["fpr"][f"{task_id}"].append(fpr)
-                # task_dict["tpr"][f"{task_id}"].append(tpr)
-                task_dict["roc_auc"][f"{task_id}"].append(roc_auc)
-                # task_dict["pre"][f"{task_id}"].append(pre)
-                # task_dict["rec"][f"{task_id}"].append(rec)
-                task_dict["prc_auc"][f"{task_id}"].append(prc_auc)
+                for key in ["fpr", "tpr", "roc_auc", "pre", "rec", "prc_auc",]:
+                    task_dict.setdefault(key, [])
+                task_dict["fpr"].append(fpr)
+                task_dict["tpr"].append(tpr)
+                task_dict["roc_auc"].append(roc_auc)
+                task_dict["pre"].append(pre)
+                task_dict["rec"].append(rec)
+                task_dict["prc_auc"].append(prc_auc)
 
 
 def _get_func_conformal(
@@ -184,3 +188,217 @@ def get_ori_metrics(
     cp_bands_by_alpha = _get_func_conformal(cal_rollouts, cal_scores_all, alphas)
     _get_calib_res(test_rollouts, test_scores_all, cp_bands_by_alpha, alphas, method_name, res_dict)
 
+
+def _get_ori_summary(
+    ori_logs,
+):
+    ori_summary = {}
+    for split, split_dict in ori_logs["static"].items():
+        ori_summary.setdefault(split, {})
+        task_dict = ori_logs["static"][split]["all"]
+        ori_summary[split]["roc_auc"] = np.array(task_dict["roc_auc"]).mean()
+        ori_summary[split]["prc_auc"] = np.array(task_dict["prc_auc"]).mean()
+    return ori_summary
+
+
+def _get_ori_figs(
+    ori_logs_by_method,
+):
+    explicit_method_colors = {
+        "lstm": "#c62828",
+        "indep": "#ef9a9a",
+    }
+    fallback_palette = [
+        "#1f77b4",
+        "#ff7f0e",
+        "#2ca02c",
+        "#9467bd",
+        "#8c564b",
+        "#7f7f7f",
+        "#bcbd22",
+        "#17becf",
+        "#e377c2",
+    ]
+    used_colors = set(explicit_method_colors.values())
+    fallback_palette = [c for c in fallback_palette if c not in used_colors]
+
+    method_colors = dict(explicit_method_colors)
+    fallback_methods = [
+        method_name
+        for method_name in sorted(ori_logs_by_method)
+        if method_name not in method_colors
+    ]
+    for i, method_name in enumerate(fallback_methods):
+        method_colors[method_name] = fallback_palette[i % len(fallback_palette)]
+
+    figs = {}
+
+    for eval_time in ["early", "last"]:
+        fig = Figure(figsize=(7, 5))
+        ax = fig.subplots()
+
+        has_curve = False
+        for method_name, runs_dict in sorted(ori_logs_by_method.items()):
+            alpha_to_avg_det_times = {}
+            alpha_to_bal_accs = {}
+
+            for _, ori_logs in sorted(runs_dict.items()):
+                calib_logs = ori_logs.get("calib", {}).get(eval_time, {})
+                if not calib_logs:
+                    continue
+
+                for alpha_str in sorted(calib_logs.keys(), key=float):
+                    alpha_dict = calib_logs[alpha_str]
+                    if "avg_det_time" not in alpha_dict or "bal_acc" not in alpha_dict:
+                        continue
+                    alpha_to_avg_det_times.setdefault(alpha_str, []).append(
+                        np.asarray(alpha_dict["avg_det_time"]).mean()
+                    )
+                    alpha_to_bal_accs.setdefault(alpha_str, []).append(
+                        np.asarray(alpha_dict["bal_acc"]).mean()
+                    )
+
+            avg_det_times = []
+            bal_accs = []
+            for alpha_str in sorted(alpha_to_avg_det_times.keys(), key=float):
+                if alpha_str not in alpha_to_bal_accs:
+                    continue
+                avg_det_times.append(np.mean(alpha_to_avg_det_times[alpha_str]))
+                bal_accs.append(np.mean(alpha_to_bal_accs[alpha_str]))
+
+            if not avg_det_times:
+                continue
+
+            has_curve = True
+            ax.plot(
+                avg_det_times,
+                bal_accs,
+                marker="o",
+                linewidth=1.5,
+                markersize=4,
+                label=method_name,
+                color=method_colors.get(method_name),
+                alpha=0.8,
+            )
+
+        ax.set_xlabel("avg_det_time")
+        ax.set_ylabel("bal_acc")
+        ax.set_title(f"avg_det_time vs bal_acc ({eval_time})")
+        ax.set_xlim(0.0, 1.0)
+        ax.set_ylim(0.0, 1.0)
+        ax.grid(True, alpha=0.3)
+        if has_curve:
+            ax.legend(fontsize=8)
+        fig.tight_layout()
+
+        figs[eval_time] = fig
+
+    return figs
+
+
+def _collect_ori_log_paths(logs_dir):
+    log_paths = []
+    direct_candidates = [
+        os.path.join(logs_dir, "eval", "my_logs.json"),
+        os.path.join(logs_dir, "eval", "mylogs.json"),
+    ]
+    for candidate in direct_candidates:
+        if os.path.isfile(candidate):
+            log_paths.append(os.path.abspath(candidate))
+
+    for root, _, files in os.walk(logs_dir):
+        if os.path.basename(root) != "eval":
+            continue
+        for filename in ("my_logs.json", "mylogs.json"):
+            if filename in files:
+                log_path = os.path.abspath(os.path.join(root, filename))
+                if log_path not in log_paths:
+                    log_paths.append(log_path)
+
+    return sorted(log_paths)
+
+
+def _get_method_name_from_config(run_dir):
+    cfg_path = os.path.join(run_dir, "config.yaml")
+    if not os.path.isfile(cfg_path):
+        return os.path.basename(run_dir)
+
+    cfg = OmegaConf.load(cfg_path)
+    method_name = cfg.model.name
+    if "distance" in cfg.model:
+        method_name += f"_{cfg.model.distance}"
+    return method_name
+
+
+def summar_ori_metrics(
+    logs_dir="logs",
+    save_dir=None,
+):
+    if not save_dir: save_dir = os.path.join(logs_dir, "summary")
+    logs_dir = os.path.abspath(logs_dir)
+    save_dir = os.path.abspath(save_dir)
+    ori_save_dir = os.path.join(save_dir, "ori")
+    os.makedirs(ori_save_dir, exist_ok=True)
+
+    ori_summary = {}
+    ori_logs_by_method = {}
+    log_paths = _collect_ori_log_paths(logs_dir)
+    for log_path in log_paths:
+        with open(log_path, "r") as f:
+            logs = json.load(f)
+
+        if "ori" not in logs:
+            continue
+
+        run_dir = os.path.dirname(os.path.dirname(log_path))
+        run_name = os.path.relpath(run_dir, logs_dir)
+        method_name = _get_method_name_from_config(run_dir)
+        ori_summary.setdefault(method_name, {})
+        ori_logs_by_method.setdefault(method_name, {})
+        ori_summary[method_name] = _get_ori_summary(logs["ori"])
+        ori_logs_by_method[method_name][run_name] = logs["ori"]
+
+    save_path = os.path.join(ori_save_dir, "ori_summary.json")
+    with open(save_path, "w") as f:
+        json.dump(ori_summary, f, indent=2)
+
+    ori_figs = _get_ori_figs(ori_logs_by_method)
+    for eval_time, fig in ori_figs.items():
+        fig.savefig(os.path.join(ori_save_dir, f"{eval_time}.png"))
+
+    return ori_summary, ori_figs
+
+
+def _resolve_default_logs_dir() -> str:
+    env_logs_dir = os.environ.get("ORI_METRICS_LOGS_DIR")
+    if env_logs_dir:
+        return env_logs_dir
+
+    for candidate in ("log_ckpt", "logs"):
+        if os.path.isdir(candidate):
+            return candidate
+
+    return "log_ckpt"
+    
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(
+        description="Summarize ori metrics from evaluation logs.",
+    )
+    parser.add_argument(
+        "logs_dir",
+        nargs="?",
+        default=None,
+        help="Root directory containing evaluation outputs with eval/my_logs.json.",
+    )
+    parser.add_argument(
+        "--save-dir",
+        default=None,
+        help="Optional output directory. Defaults to <logs_dir>/summary.",
+    )
+    args = parser.parse_args()
+
+    summar_ori_metrics(
+        logs_dir=args.logs_dir or _resolve_default_logs_dir(),
+        save_dir=args.save_dir,
+    )
