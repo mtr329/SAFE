@@ -3,13 +3,10 @@ import os
 import sys
 from numbers import Number
 from pathlib import Path
-import warnings
 
 import hydra
 import numpy as np
 from omegaconf import OmegaConf
-from sklearn.metrics import roc_curve, auc, precision_recall_curve
-from sklearn.metrics import roc_auc_score, average_precision_score
 
 import torch
 from torch.utils.data import DataLoader
@@ -30,6 +27,9 @@ from failure_prob.utils.timer import Timer
 from failure_prob.utils.video import eval_save_videos, eval_save_videos_functional_cp
 from failure_prob.utils.routines import (
     model_forward_dataloader
+)
+from failure_prob.utils.metrics import (
+    get_metrics_curve
 )
 
 from failure_prob.conf import Config, process_cfg
@@ -187,6 +187,8 @@ def evaluate_cfg(cfg: Config) -> None:
     if "distance" in cfg.model:
         method_name += f"_{cfg.model.distance}"
 
+    is_handcrafted = bool(cfg.train.log_precomputed or cfg.train.log_precomputed_only)
+    
     if (
         cfg.train.eval_save_logs
         or cfg.train.eval_save_video
@@ -212,10 +214,9 @@ def evaluate_cfg(cfg: Config) -> None:
         all_rollouts = normalize_rollouts_hidden_states(all_rollouts)
 
     seeds = parse_seeds(cfg.train.seed)
-    scalar_logs_by_seed = []
+    
     my_logs = {}
     my_logs_save_dir = None
-    ori_logs = {}
     for seed in seeds:
         print(f"Evaluating seed {seed}")
         cfg.train.seed = seed
@@ -250,15 +251,32 @@ def evaluate_cfg(cfg: Config) -> None:
             )
             for split, dataset in dataset_by_split_name.items()
         }
-
-        to_be_logged = {"epoch": 0}
         
-        if cfg.train.log_precomputed or cfg.train.log_precomputed_only:
-            pass
-            # my eval
-            
+        if is_handcrafted:
+            metric_keys = MANUAL_METRICS[cfg.dataset.name]
+            if metric_keys is None:
+                metric_keys = rollouts_by_split_name['train'][0].logs.columns
 
-        if not cfg.train.log_precomputed_only:
+            for metric_key in metric_keys:
+                if metric_key not in rollouts_by_split_name['train'][0].logs.columns:
+                    print(f"Skipping {metric_key}")
+                    continue
+                
+                metric_name = metric_key.split("/")[-1]
+                scores_by_split_name = {
+                    k: get_metrics_curve(v, metric_key) 
+                    for k, v in rollouts_by_split_name.items()
+                }
+
+                my_logs.setdefault("ori", {})
+                get_ori_metrics(
+                    scores_by_split_name, 
+                    rollouts_by_split_name,
+                    metric_name,
+                    my_logs["ori"],
+                )
+
+        else:
             if my_logs_save_dir is None:
                 my_logs_save_dir = resolve_eval_output_dir(ckpt_path)
             input_dim = rollouts_by_split_name["train"][0].hidden_states.shape[-1]
@@ -292,8 +310,7 @@ def evaluate_cfg(cfg: Config) -> None:
                 method_name,
                 my_logs["ori"],
             )
-
-
+        
     if my_logs_save_dir is None:
         my_logs_save_dir = resolve_eval_output_dir(cfg.train.eval_ckpt_path)
     my_logs_save_dir = os.path.join(my_logs_save_dir, "eval")

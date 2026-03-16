@@ -14,14 +14,34 @@ from failure_prob.utils.conformal.functional_predictor import (
     FunctionalPredictor
 )
 
+# Set to a collection of handcrafted method names to keep only those methods.
+# Use None to disable handcrafted filtering.
+HANDCRAFTED_METHOD_ALLOWLIST = [
+    "avg_token_prob",
+    "avg_token_entropy",
+    "max_token_prob",
+    "max_token_entropy",
+    
+    "total_var",
+    "pos_var",
+    "rot_var",
+    "gripper_var",
+    "entropy_linkage0.01",
+    "entropy_linkage0.05"
+    "stac_mmd",
+    "stac_single",
+]
+
 
 def _get_ori_static_metrics(
     scores_by_split_name,
     rollouts_by_split_name,
+    method_name,
     res_dict,
 ):
     res_dict.setdefault("static", {})
-    static_dict = res_dict["static"]
+    res_dict["static"].setdefault(method_name, {})
+    static_dict = res_dict["static"][method_name]
     
     for split, rollouts_split in rollouts_by_split_name.items():
         static_dict.setdefault(split, {})
@@ -96,7 +116,8 @@ def _get_calib_res(
     res_dict,
 ):
     res_dict.setdefault("calib", {})
-    calib_dict = res_dict["calib"]
+    res_dict["calib"].setdefault(method_name, {})
+    calib_dict = res_dict["calib"][method_name]
 
     lower_bound = False
     test_earliest_stop = np.array([r.task_min_step for r in test_rollouts]) # (N,)
@@ -167,7 +188,7 @@ def get_ori_metrics(
     res_dict,
 ):
     # static metrics
-    _get_ori_static_metrics(scores_by_split_name, rollouts_by_split_name, res_dict)
+    _get_ori_static_metrics(scores_by_split_name, rollouts_by_split_name, method_name, res_dict)
 
     # calib
     alphas = [0.02, 0.05, 0.1, 0.15, 0.2, 0.25, 0.3, 0.35, 0.4, 0.45, 0.5, 0.6, 0.7, 0.8, 0.9]
@@ -201,12 +222,64 @@ def _get_ori_summary(
     return ori_summary
 
 
+def _split_ori_logs_by_method(
+    ori_logs: dict,
+    fallback_method_name: str,
+) -> dict[str, dict]:
+    static_logs = ori_logs.get("static", {})
+    calib_logs = ori_logs.get("calib", {})
+
+    # Old format:
+    #   ori["static"][split][task]
+    #   ori["calib"][eval_time][alpha]
+    if any(split in static_logs for split in ("train", "val_seen", "val_unseen")):
+        return {
+            fallback_method_name: {
+                "static": static_logs,
+                "calib": calib_logs,
+            }
+        }
+
+    # New format:
+    #   ori["static"][method_name][split][task]
+    #   ori["calib"][method_name][eval_time][alpha]
+    method_names = set(static_logs.keys()) | set(calib_logs.keys())
+    method_logs_by_name = {}
+    for method_name in sorted(method_names):
+        method_logs_by_name[method_name] = {
+            "static": static_logs.get(method_name, {}),
+            "calib": calib_logs.get(method_name, {}),
+        }
+    return method_logs_by_name
+
+
+def _summarize_method_runs(runs_dict: dict[str, dict]) -> dict:
+    summary_acc = {}
+    for ori_logs in runs_dict.values():
+        run_summary = _get_ori_summary(ori_logs)
+        for split, metrics in run_summary.items():
+            summary_acc.setdefault(split, {})
+            for metric_name, value in metrics.items():
+                summary_acc[split].setdefault(metric_name, []).append(value)
+
+    return {
+        split: {
+            metric_name: float(np.mean(values))
+            for metric_name, values in metrics.items()
+        }
+        for split, metrics in summary_acc.items()
+    }
+
+
 def _get_ori_figs(
     ori_logs_by_method,
 ):
+    line_alpha = 0.75
+    line_width = 2.0
+    marker_size = 5
     explicit_method_colors = {
         "lstm": "#c62828",
-        "indep": "#ef9a9a",
+        "indep": "#ff69b4",
     }
     fallback_palette = [
         "#1f77b4",
@@ -274,11 +347,12 @@ def _get_ori_figs(
                 avg_det_times,
                 bal_accs,
                 marker="o",
-                linewidth=1.5,
-                markersize=4,
+                linewidth=line_width,
+                markersize=marker_size,
                 label=method_name,
                 color=method_colors.get(method_name),
-                alpha=0.8,
+                alpha=line_alpha,
+                markeredgewidth=0.0,
             )
 
         ax.set_xlabel("avg_det_time")
@@ -288,7 +362,7 @@ def _get_ori_figs(
         ax.set_ylim(0.0, 1.0)
         ax.grid(True, alpha=0.3)
         if has_curve:
-            ax.legend(fontsize=8)
+            ax.legend(fontsize=8, loc="lower right", framealpha=0.9, ncol=2)
         fig.tight_layout()
 
         figs[eval_time] = fig
@@ -330,6 +404,30 @@ def _get_method_name_from_config(run_dir):
     return method_name
 
 
+def _get_run_meta_from_config(run_dir) -> dict:
+    cfg_path = os.path.join(run_dir, "config.yaml")
+    if not os.path.isfile(cfg_path):
+        method_name = os.path.basename(run_dir)
+        return {
+            "method_name": method_name,
+            "is_handcrafted": False,
+            "exp_suffix": None,
+        }
+
+    cfg = OmegaConf.load(cfg_path)
+    method_name = cfg.model.name
+    if "distance" in cfg.model:
+        method_name += f"_{cfg.model.distance}"
+
+    exp_suffix = getattr(cfg.train, "exp_suffix", None)
+    is_handcrafted = bool(getattr(cfg.train, "log_precomputed_only", False))
+    return {
+        "method_name": method_name,
+        "is_handcrafted": is_handcrafted,
+        "exp_suffix": exp_suffix,
+    }
+
+
 def summar_ori_metrics(
     logs_dir="logs",
     save_dir=None,
@@ -352,11 +450,21 @@ def summar_ori_metrics(
 
         run_dir = os.path.dirname(os.path.dirname(log_path))
         run_name = os.path.relpath(run_dir, logs_dir)
-        method_name = _get_method_name_from_config(run_dir)
-        ori_summary.setdefault(method_name, {})
-        ori_logs_by_method.setdefault(method_name, {})
-        ori_summary[method_name] = _get_ori_summary(logs["ori"])
-        ori_logs_by_method[method_name][run_name] = logs["ori"]
+        run_meta = _get_run_meta_from_config(run_dir)
+        fallback_method_name = run_meta["method_name"]
+        method_logs_by_name = _split_ori_logs_by_method(logs["ori"], fallback_method_name)
+        for method_name, method_logs in method_logs_by_name.items():
+            if (
+                run_meta["is_handcrafted"]
+                and HANDCRAFTED_METHOD_ALLOWLIST is not None
+                and method_name not in HANDCRAFTED_METHOD_ALLOWLIST
+            ):
+                continue
+            ori_logs_by_method.setdefault(method_name, {})
+            ori_logs_by_method[method_name][run_name] = method_logs
+
+    for method_name, runs_dict in ori_logs_by_method.items():
+        ori_summary[method_name] = _summarize_method_runs(runs_dict)
 
     save_path = os.path.join(ori_save_dir, "ori_summary.json")
     with open(save_path, "w") as f:
