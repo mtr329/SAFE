@@ -1,6 +1,5 @@
 import argparse
 from sklearn.metrics import roc_curve, auc, precision_recall_curve
-from sklearn.metrics import roc_auc_score, average_precision_score
 import warnings
 import numpy as np
 import os
@@ -9,29 +8,8 @@ import pandas as pd
 from omegaconf import OmegaConf
 from matplotlib.figure import Figure
 
-from failure_prob.utils.conformal.functional_predictor import (
-    RegressionType,
-    ModulationType,
-    FunctionalPredictor
-)
-
-# Set to a collection of handcrafted method names to keep only those methods.
-# Use None to disable handcrafted filtering.
-HANDCRAFTED_METHOD_ALLOWLIST = [
-    "avg_token_prob",
-    "avg_token_entropy",
-    "max_token_prob",
-    "max_token_entropy",
-    
-    "total_var",
-    "pos_var",
-    "rot_var",
-    "gripper_var",
-    "entropy_linkage0.01",
-    "entropy_linkage0.05"
-    "stac_mmd",
-    "stac_single",
-]
+from failure_prob.mrefine.const import HANDCRAFTED_METHOD_ALLOWLIST
+from failure_prob.mrefine.utils import get_func_conformal_bands
 
 
 def _get_ori_static_metrics(
@@ -78,34 +56,6 @@ def _get_ori_static_metrics(
                 task_dict["pre"].append(pre)
                 task_dict["rec"].append(rec)
                 task_dict["prc_auc"].append(prc_auc)
-
-
-def _get_func_conformal(
-    cal_rollouts,
-    cal_scores_all,
-    alphas,
-):
-    # neg
-    lower_bound = False
-    cal_scores_used = [s for s, r in zip(cal_scores_all, cal_rollouts) if r.episode_success == 1]
-    cal_scores_used = np.array(cal_scores_used)
-    if len(cal_scores_used) == 1:
-        cal_scores_1 = cal_scores_used
-        cal_scores_2 = cal_scores_used
-    else:
-        np.random.shuffle(cal_scores_used)
-        n_cal_1 = int(len(cal_scores_used) * 0.3) # 30% according to Chen's implementation
-        cal_scores_1 = cal_scores_used[:n_cal_1]
-        cal_scores_2 = cal_scores_used[n_cal_1:]
-
-    cp_bands_by_alpha = {}
-    for alpha in alphas:
-        predictor = FunctionalPredictor(ModulationType.Tfunc, RegressionType.Mean)
-        cp_band = predictor.get_one_sided_prediction_band(
-            cal_scores_1, cal_scores_2, alpha, lower_bound=lower_bound)
-        
-        cp_bands_by_alpha[alpha] = cp_band
-    return cp_bands_by_alpha
 
 
 def _get_calib_res(
@@ -207,7 +157,7 @@ def get_ori_metrics(
     for i, s in enumerate(test_scores_all):
         test_scores_all[i] = np.pad(s, (0, max_length - len(s)), mode='edge')
 
-    cp_bands_by_alpha = _get_func_conformal(cal_rollouts, cal_scores_all, alphas)
+    cp_bands_by_alpha = get_func_conformal_bands(cal_rollouts, cal_scores_all, alphas)
     _get_calib_res(test_rollouts, test_scores_all, cp_bands_by_alpha, alphas, method_name, res_dict)
 
 
@@ -394,6 +344,7 @@ def _get_ori_figs(
 def _collect_ori_log_paths(logs_dir):
     log_paths = []
     direct_candidates = [
+        os.path.join(logs_dir, "eval", "ori_logs.json"),
         os.path.join(logs_dir, "eval", "my_logs.json"),
         os.path.join(logs_dir, "eval", "mylogs.json"),
     ]
@@ -404,7 +355,7 @@ def _collect_ori_log_paths(logs_dir):
     for root, _, files in os.walk(logs_dir):
         if os.path.basename(root) != "eval":
             continue
-        for filename in ("my_logs.json", "mylogs.json"):
+        for filename in ("ori_logs.json", "my_logs.json", "mylogs.json"):
             if filename in files:
                 log_path = os.path.abspath(os.path.join(root, filename))
                 if log_path not in log_paths:
@@ -449,7 +400,7 @@ def _get_run_meta_from_config(run_dir) -> dict:
     }
 
 
-def summar_ori_metrics(
+def summary_ori_metrics(
     logs_dir="logs",
     save_dir=None,
 ):
@@ -466,14 +417,18 @@ def summar_ori_metrics(
         with open(log_path, "r") as f:
             logs = json.load(f)
 
-        if "ori" not in logs:
-            continue
+        if os.path.basename(log_path) == "ori_logs.json":
+            ori_logs = logs
+        else:
+            if "ori" not in logs:
+                continue
+            ori_logs = logs["ori"]
 
         run_dir = os.path.dirname(os.path.dirname(log_path))
         run_name = os.path.relpath(run_dir, logs_dir)
         run_meta = _get_run_meta_from_config(run_dir)
         fallback_method_name = run_meta["method_name"]
-        method_logs_by_name = _split_ori_logs_by_method(logs["ori"], fallback_method_name)
+        method_logs_by_name = _split_ori_logs_by_method(ori_logs, fallback_method_name)
         for method_name, method_logs in method_logs_by_name.items():
             if (
                 run_meta["is_handcrafted"]
@@ -521,7 +476,7 @@ if __name__ == "__main__":
         "logs_dir",
         nargs="?",
         default=None,
-        help="Root directory containing evaluation outputs with eval/my_logs.json.",
+        help="Root directory containing evaluation outputs with eval/ori_logs.json or eval/my_logs.json.",
     )
     parser.add_argument(
         "--save-dir",
@@ -530,7 +485,7 @@ if __name__ == "__main__":
     )
     args = parser.parse_args()
 
-    summar_ori_metrics(
+    summary_ori_metrics(
         logs_dir=args.logs_dir or _resolve_default_logs_dir(),
         save_dir=args.save_dir,
     )

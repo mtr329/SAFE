@@ -36,9 +36,9 @@ from failure_prob.conf import Config, process_cfg
 
 from failure_prob.mrefine.ori_metrics import (
     get_ori_metrics,
-    summar_ori_metrics,
 )
 from failure_prob.mrefine.delay_metrics import get_delay_metrics
+from failure_prob.mrefine.new_metrics import get_new_metrics
 
 
 def parse_seeds(seed_cfg: str | int) -> list[int]:
@@ -154,6 +154,28 @@ def collect_eval_dirs(target_root: Path) -> list[Path]:
     return config_dirs
 
 
+def collect_task_min_steps(rollouts_by_split_name: dict[str, list]) -> dict[str, dict[str, int | list[int]]]:
+    summary = {}
+    for split_name, rollouts in rollouts_by_split_name.items():
+        task_to_steps = {}
+        for rollout in rollouts:
+            task_to_steps.setdefault(int(rollout.task_id), set()).add(int(rollout.task_min_step))
+
+        summary[split_name] = {}
+        for task_id in sorted(task_to_steps):
+            step_values = sorted(task_to_steps[task_id])
+            summary[split_name][str(task_id)] = step_values[0] if len(step_values) == 1 else step_values
+    return summary
+
+
+def print_task_min_steps(task_min_steps_by_split: dict[str, dict[str, int | list[int]]]) -> None:
+    print("Task early-step lengths (task_min_step):")
+    for split_name, task_dict in task_min_steps_by_split.items():
+        print(f"  {split_name}:")
+        for task_id, step_value in task_dict.items():
+            print(f"    task {task_id}: {step_value}")
+
+
 def run_batch_eval(target_root: Path) -> None:
     target_dirs = collect_eval_dirs(target_root)
     if not target_dirs:
@@ -217,6 +239,7 @@ def evaluate_cfg(cfg: Config) -> None:
     seeds = parse_seeds(cfg.train.seed)
     
     my_logs = {}
+    task_min_step_logs = {}
     my_logs_save_dir = None
     for seed in seeds:
         print(f"Evaluating seed {seed}")
@@ -230,6 +253,9 @@ def evaluate_cfg(cfg: Config) -> None:
 
         split_path = resolve_split_path(cfg.train.eval_split_path, ckpt_path, seed)
         rollouts_by_split_name = split_rollouts(cfg, all_rollouts)
+        task_min_steps_by_split = collect_task_min_steps(rollouts_by_split_name)
+        task_min_step_logs[str(seed)] = task_min_steps_by_split
+        print_task_min_steps(task_min_steps_by_split)
         if split_path is not None:
             print("Loading split signature from", os.path.abspath(split_path))
             split_signature = load_split_signature(split_path)
@@ -277,6 +303,14 @@ def evaluate_cfg(cfg: Config) -> None:
                     my_logs["ori"],
                 )
 
+                my_logs.setdefault("new", {})
+                get_new_metrics(
+                    scores_by_split_name,
+                    rollouts_by_split_name,
+                    metric_name,
+                    my_logs["new"],
+                )
+
         else:
             if my_logs_save_dir is None:
                 my_logs_save_dir = resolve_eval_output_dir(ckpt_path)
@@ -321,15 +355,36 @@ def evaluate_cfg(cfg: Config) -> None:
                 my_logs["delay"]
             )
 
+            my_logs.setdefault("new", {})
+            get_new_metrics(
+                scores_by_split_name,
+                rollouts_by_split_name,
+                method_name,
+                my_logs["new"],
+            )
+
         
     if my_logs_save_dir is None:
         my_logs_save_dir = resolve_eval_output_dir(cfg.train.eval_ckpt_path)
     my_logs_save_dir = os.path.join(my_logs_save_dir, "eval")
     os.makedirs(my_logs_save_dir, exist_ok=True)
-    my_logs_save_path = os.path.join(my_logs_save_dir, "my_logs.json")
-    with open(my_logs_save_path, "w") as f:
-        json.dump(to_jsonable(my_logs), f, indent=2)
-    print("Saved my_logs to", os.path.abspath(my_logs_save_path))
+    metric_log_filenames = {
+        "ori": "ori_logs.json",
+        "delay": "delay_logs.json",
+        "new": "new_logs.json",
+    }
+    for metric_name, filename in metric_log_filenames.items():
+        if metric_name not in my_logs:
+            continue
+        metric_save_path = os.path.join(my_logs_save_dir, filename)
+        with open(metric_save_path, "w") as f:
+            json.dump(to_jsonable(my_logs[metric_name]), f, indent=2)
+        print(f"Saved {metric_name} logs to", os.path.abspath(metric_save_path))
+
+    task_min_step_save_path = os.path.join(my_logs_save_dir, "task_min_steps.json")
+    with open(task_min_step_save_path, "w") as f:
+        json.dump(to_jsonable(task_min_step_logs), f, indent=2)
+    print("Saved task_min_step logs to", os.path.abspath(task_min_step_save_path))
 
 
 @hydra.main(version_base=None, config_path="conf", config_name="config")
