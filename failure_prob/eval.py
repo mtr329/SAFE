@@ -34,11 +34,11 @@ from failure_prob.utils.metrics import (
 
 from failure_prob.conf import Config, process_cfg
 
-from failure_prob.mrefine.ori_metrics import (
+from failure_prob.mrefine.ori_eval import (
     get_ori_metrics,
 )
-from failure_prob.mrefine.delay_metrics import get_delay_metrics
-from failure_prob.mrefine.new_metrics import get_new_metrics
+from failure_prob.mrefine.delay_eval import get_delay_metrics
+from failure_prob.mrefine.new_eval import get_new_metrics
 
 
 def parse_seeds(seed_cfg: str | int) -> list[int]:

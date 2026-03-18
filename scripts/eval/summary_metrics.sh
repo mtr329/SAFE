@@ -69,7 +69,6 @@ run_summary() {
     env PYTHONPATH=. "${cmd[@]}"
 }
 
-run_summary failure_prob.mrefine.ori_metrics
-run_summary failure_prob.mrefine.delay_metrics
-run_summary failure_prob.mrefine.new_metrics
-
+run_summary failure_prob.mrefine.ori_summary
+run_summary failure_prob.mrefine.delay_summary
+run_summary failure_prob.mrefine.new_summary
