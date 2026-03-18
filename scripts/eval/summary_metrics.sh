@@ -2,7 +2,7 @@
 
 set -euo pipefail
 
-# Summarize ori, delay, and new metrics from evaluation logs.
+# Summarize ori, delay, new, and ref metrics from evaluation logs.
 #
 # Usage:
 #   scripts/eval/summary_metrics.sh
@@ -72,3 +72,4 @@ run_summary() {
 run_summary failure_prob.mrefine.ori_summary
 run_summary failure_prob.mrefine.delay_summary
 run_summary failure_prob.mrefine.new_summary
+run_summary failure_prob.mrefine.ref_summary

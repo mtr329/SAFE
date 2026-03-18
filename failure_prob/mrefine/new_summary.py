@@ -13,6 +13,7 @@ from omegaconf import OmegaConf
 from failure_prob.mrefine.const import HANDCRAFTED_METHOD_ALLOWLIST
 
 PREFIX_AUC_PLOT_PREFIXES = [f"{p:.2f}" for p in np.arange(0.10, 1.001, 0.10)]
+TEMPORAL_LAMBDA_TAGS = ("lam1p0", "lam3p0", "lam5p0")
 
 
 def _split_new_logs_by_method(
@@ -21,21 +22,24 @@ def _split_new_logs_by_method(
 ) -> dict[str, dict]:
     static_logs = new_logs.get("static", {})
     calib_logs = new_logs.get("calib", {})
+    soft_logs = new_logs.get("soft", {})
 
     if any(split in static_logs for split in ("train", "val_seen", "val_unseen")):
         return {
             fallback_method_name: {
                 "static": static_logs,
                 "calib": calib_logs,
+                "soft": soft_logs,
             }
         }
 
-    method_names = set(static_logs.keys()) | set(calib_logs.keys())
+    method_names = set(static_logs.keys()) | set(calib_logs.keys()) | set(soft_logs.keys())
     method_logs_by_name = {}
     for method_name in sorted(method_names):
         method_logs_by_name[method_name] = {
             "static": static_logs.get(method_name, {}),
             "calib": calib_logs.get(method_name, {}),
+            "soft": soft_logs.get(method_name, {}),
         }
     return method_logs_by_name
 
@@ -138,6 +142,7 @@ def _summarize_new_calib(new_logs: dict) -> dict:
 def _merge_new_summaries(runs_dict: dict[str, dict]) -> dict:
     static_acc = {}
     calib_acc = {}
+    soft_acc = {}
 
     for new_logs in runs_dict.values():
         static_summary = _summarize_new_static(new_logs)
@@ -162,6 +167,17 @@ def _merge_new_summaries(runs_dict: dict[str, dict]) -> dict:
                             calib_acc[mode][delta][alpha][metric_name] = value
                         else:
                             calib_acc[mode][delta][alpha].setdefault(metric_name, []).append(value)
+
+        soft_summary = _summarize_new_soft(new_logs)
+        for mode, delta_dict in soft_summary.items():
+            soft_acc.setdefault(mode, {})
+            for delta, metrics in delta_dict.items():
+                soft_acc[mode].setdefault(delta, {})
+                for metric_name, value in metrics.items():
+                    if metric_name == "detect_method":
+                        soft_acc[mode][delta][metric_name] = value
+                    else:
+                        soft_acc[mode][delta].setdefault(metric_name, []).append(value)
 
     static_summary = {
         split_name: {
@@ -190,10 +206,83 @@ def _merge_new_summaries(runs_dict: dict[str, dict]) -> dict:
                     else:
                         calib_summary[mode][delta][alpha][metric_name] = float(np.mean(value))
 
+    soft_summary = {}
+    for mode, delta_dict in soft_acc.items():
+        soft_summary.setdefault(mode, {})
+        for delta, metrics in delta_dict.items():
+            soft_summary[mode].setdefault(delta, {})
+            for metric_name, value in metrics.items():
+                if metric_name == "detect_method":
+                    soft_summary[mode][delta][metric_name] = value
+                else:
+                    soft_summary[mode][delta][metric_name] = float(np.mean(value))
+
     return {
         "static": static_summary,
         "calib": calib_summary,
+        "soft": soft_summary,
     }
+
+
+def _summarize_new_soft(new_logs: dict) -> dict:
+    summary = {}
+    soft_logs = new_logs.get("soft", {})
+    for mode, delta_dict in soft_logs.items():
+        summary.setdefault(mode, {})
+        for delta, metrics_dict in delta_dict.items():
+            summary[mode].setdefault(delta, {})
+            for metric_name, value in metrics_dict.items():
+                if metric_name == "detect_method":
+                    summary[mode][delta][metric_name] = value
+                else:
+                    summary[mode][delta][metric_name] = float(np.asarray(value).mean())
+    return summary
+
+
+def _new_calib_summary_to_df(new_summary: dict) -> pd.DataFrame:
+    rows = []
+    for method_name, summary in new_summary.items():
+        for mode, delta_dict in summary.get("calib", {}).items():
+            for delta, alpha_dict in delta_dict.items():
+                for alpha, metrics in alpha_dict.items():
+                    row = {
+                        "method": method_name,
+                        "mode": mode,
+                        "delta": float(delta),
+                        "alpha": float(alpha),
+                    }
+                    row.update(metrics)
+                    rows.append(row)
+
+    if not rows:
+        return pd.DataFrame(
+            columns=["method", "mode", "delta", "alpha", "avg_det_time", "ttd_auc", "bal_acc"]
+        )
+
+    df = pd.DataFrame(rows)
+    return df.sort_values(by=["method", "mode", "delta", "alpha"]).reset_index(drop=True)
+
+
+def _new_soft_summary_to_df(new_summary: dict) -> pd.DataFrame:
+    rows = []
+    for method_name, summary in new_summary.items():
+        for mode, delta_dict in summary.get("soft", {}).items():
+            for delta, metrics in delta_dict.items():
+                row = {
+                    "method": method_name,
+                    "mode": mode,
+                    "delta": float(delta),
+                }
+                row.update(metrics)
+                rows.append(row)
+
+    if not rows:
+        return pd.DataFrame(
+            columns=["method", "mode", "delta", "soft_avg_det_time", "soft_ttd_auc"]
+        )
+
+    df = pd.DataFrame(rows)
+    return df.sort_values(by=["method", "mode", "delta"]).reset_index(drop=True)
 
 
 def _get_method_colors(method_names):
@@ -502,6 +591,253 @@ def _get_new_prefix_auc_figs(new_summary: dict) -> dict[str, Figure]:
     return figs
 
 
+def _get_new_soft_metric_figs(new_summary: dict) -> dict[str, Figure]:
+    figs = {}
+    method_colors = _get_method_colors(new_summary.keys())
+    metric_specs = (
+        ("soft_ttd_auc", "soft_ttd_auc"),
+        ("soft_avg_det_time", "soft_avg_det_time"),
+    )
+
+    for mode in ["early", "last"]:
+        for metric_name, ylabel in metric_specs:
+            fig = Figure(figsize=(7, 5))
+            ax = fig.subplots()
+            has_curve = False
+
+            for method_name, summary in sorted(new_summary.items()):
+                delta_dict = summary.get("soft", {}).get(mode, {})
+                deltas = sorted(delta_dict.keys(), key=float)
+                x = []
+                y = []
+                for delta in deltas:
+                    metric_value = delta_dict[delta].get(metric_name)
+                    if metric_value is None:
+                        continue
+                    x.append(float(delta))
+                    y.append(float(metric_value))
+
+                if not x:
+                    continue
+
+                has_curve = True
+                ax.plot(
+                    x,
+                    y,
+                    marker="o",
+                    linewidth=2.0,
+                    markersize=5,
+                    color=method_colors[method_name],
+                    alpha=0.85,
+                    label=method_name,
+                )
+
+            ax.set_xlabel("delay")
+            ax.set_ylabel(ylabel)
+            ax.set_title(mode)
+            ax.set_xlim(left=0.0)
+            ax.set_ylim(0.0, 1.0)
+            ax.grid(True, alpha=0.3)
+            if has_curve:
+                ax.legend(fontsize=8, loc="best", framealpha=0.9, ncol=2)
+            fig.tight_layout()
+            figs[f"{metric_name}_{mode}"] = fig
+
+    return figs
+
+
+def _metric_prefers_delay_x(metric_name: str) -> bool:
+    if metric_name in ("ttd_auc",):
+        return True
+    if metric_name.startswith("discounted_ttd_auc_"):
+        return True
+    if metric_name.startswith("discounted_correct_"):
+        return True
+    return False
+
+
+def _format_metric_title(metric_name: str) -> str:
+    if metric_name == "ttd_auc":
+        return "ttd_auc"
+    if metric_name.startswith("discounted_ttd_auc_"):
+        lambda_tag = metric_name.replace("discounted_ttd_auc_", "")
+        return f"discounted_ttd_auc ({lambda_tag})"
+    if metric_name.startswith("discounted_correct_"):
+        lambda_tag = metric_name.replace("discounted_correct_", "")
+        return f"discounted_correct ({lambda_tag})"
+    return metric_name
+
+
+def _get_new_alpha_metric_figs(new_summary: dict) -> dict[str, Figure]:
+    figs = {}
+    metric_specs = [
+        ("avg_det_time", "avg_det_time"),
+        ("ttd_auc", "ttd_auc"),
+        ("bal_acc", "bal_acc"),
+        ("fpr", "fpr"),
+        ("fnr", "fnr"),
+    ]
+    for lambda_tag in TEMPORAL_LAMBDA_TAGS:
+        metric_specs.append((f"discounted_ttd_auc_{lambda_tag}", f"discounted_ttd_auc_{lambda_tag}"))
+        metric_specs.append((f"discounted_correct_{lambda_tag}", f"discounted_correct_{lambda_tag}"))
+
+    for method_name, summary in sorted(new_summary.items()):
+        for metric_name, ylabel in metric_specs:
+            fig = Figure(figsize=(12, 5))
+            axes = fig.subplots(1, 2)
+            if not isinstance(axes, np.ndarray):
+                axes = np.asarray([axes])
+
+            for ax, mode in zip(axes, ["early", "last"]):
+                delta_dict = summary.get("calib", {}).get(mode, {})
+                deltas = sorted(delta_dict.keys(), key=float)
+                has_curve = False
+
+                if _metric_prefers_delay_x(metric_name):
+                    all_alphas = sorted({
+                        alpha
+                        for alpha_dict in delta_dict.values()
+                        for alpha in alpha_dict.keys()
+                    }, key=float)
+                    palette = _get_ordered_palette(len(all_alphas), cmap_name="turbo")
+
+                    for i, alpha in enumerate(all_alphas):
+                        x = []
+                        y = []
+                        for delta in deltas:
+                            metrics = delta_dict[delta].get(alpha, {})
+                            metric_value = metrics.get(metric_name)
+                            if metric_value is None:
+                                continue
+                            x.append(float(delta))
+                            y.append(float(metric_value))
+
+                        if not x:
+                            continue
+
+                        has_curve = True
+                        ax.plot(
+                            x,
+                            y,
+                            marker="o",
+                            linewidth=2.0,
+                            markersize=4,
+                            color=palette[i % len(palette)],
+                            alpha=0.9,
+                            label=f"alpha={float(alpha):.2f}",
+                        )
+
+                    ax.set_xlabel("delay")
+                else:
+                    palette = _get_ordered_palette(len(deltas), cmap_name="turbo")
+
+                    for i, delta in enumerate(deltas):
+                        alpha_dict = delta_dict[delta]
+                        alphas = sorted(alpha_dict.keys(), key=float)
+                        x = []
+                        y = []
+                        for alpha in alphas:
+                            metrics = alpha_dict[alpha]
+                            metric_value = metrics.get(metric_name)
+                            if metric_value is None:
+                                continue
+                            x.append(float(alpha))
+                            y.append(float(metric_value))
+
+                        if not x:
+                            continue
+
+                        has_curve = True
+                        ax.plot(
+                            x,
+                            y,
+                            marker="o",
+                            linewidth=2.0,
+                            markersize=4,
+                            color=palette[i % len(palette)],
+                            alpha=0.9,
+                            label=f"delay={delta}",
+                        )
+
+                    ax.set_xlabel("alpha")
+
+                ax.set_ylabel(ylabel)
+                ax.set_title(mode)
+                if _metric_prefers_delay_x(metric_name):
+                    ax.set_xlim(left=0.0)
+                else:
+                    ax.set_xlim(0.0, 1.0)
+                ax.set_ylim(0.0, 1.0)
+                ax.grid(True, alpha=0.3)
+                if has_curve:
+                    ax.legend(fontsize=8, loc="best", framealpha=0.9, ncol=2)
+
+            metric_title = _format_metric_title(metric_name)
+            if _metric_prefers_delay_x(metric_name):
+                fig.suptitle(f"{method_name}: {metric_title} vs delay by alpha")
+                figs[f"{method_name}_{metric_name}_vs_delay_by_alpha"] = fig
+            else:
+                fig.suptitle(f"{method_name}: {metric_title} vs alpha by delay")
+                figs[f"{method_name}_{metric_name}_vs_alpha_by_delay"] = fig
+            fig.tight_layout()
+
+    return figs
+
+
+def _get_alpha_metric_name_from_fig_name(fig_name: str) -> str | None:
+    suffixes = (
+        "_vs_alpha_by_delay",
+        "_vs_delay_by_alpha",
+    )
+    metric_part = None
+    for suffix in suffixes:
+        if fig_name.endswith(suffix):
+            metric_part = fig_name[: -len(suffix)]
+            break
+    if metric_part is None:
+        return None
+
+    for lambda_tag in TEMPORAL_LAMBDA_TAGS:
+        discounted_metric_names = (
+            f"discounted_ttd_auc_{lambda_tag}",
+            f"discounted_correct_{lambda_tag}",
+        )
+        for metric_name in discounted_metric_names:
+            if metric_part.endswith(f"_{metric_name}"):
+                return metric_name
+
+    for metric_name in ("avg_det_time", "ttd_auc", "bal_acc", "fpr", "fnr"):
+        if metric_part.endswith(f"_{metric_name}"):
+            return metric_name
+    return None
+
+
+def _organize_alpha_metric_root_files(
+    alpha_curve_save_dir: str,
+    alpha_metric_save_dirs: dict[str, str],
+) -> None:
+    if not os.path.isdir(alpha_curve_save_dir):
+        return
+
+    for filename in os.listdir(alpha_curve_save_dir):
+        file_path = os.path.join(alpha_curve_save_dir, filename)
+        if not os.path.isfile(file_path) or not filename.endswith(".png"):
+            continue
+
+        fig_name = filename[: -len(".png")]
+        metric_name = _get_alpha_metric_name_from_fig_name(fig_name)
+        if metric_name is None:
+            continue
+
+        target_dir = alpha_metric_save_dirs.get(metric_name)
+        if target_dir is None:
+            continue
+
+        os.makedirs(target_dir, exist_ok=True)
+        target_path = os.path.join(target_dir, filename)
+        os.replace(file_path, target_path)
+
+
 def summary_new_metrics(
     logs_dir="logs",
     save_dir=None,
@@ -512,9 +848,29 @@ def summary_new_metrics(
     save_dir = os.path.abspath(save_dir)
     new_save_dir = os.path.join(save_dir, "new")
     os.makedirs(new_save_dir, exist_ok=True)
+    calib_save_dir = os.path.join(new_save_dir, "calib")
+    soft_save_dir = os.path.join(new_save_dir, "soft")
+    alpha_curve_save_dir = os.path.join(new_save_dir, "metrics_vs_alpha")
+    alpha_metric_save_dirs = {
+        metric_name: os.path.join(alpha_curve_save_dir, metric_name)
+        for metric_name in (
+            "avg_det_time",
+            "ttd_auc",
+            "bal_acc",
+            "fpr",
+            "fnr",
+            *[f"discounted_ttd_auc_{tag}" for tag in TEMPORAL_LAMBDA_TAGS],
+            *[f"discounted_correct_{tag}" for tag in TEMPORAL_LAMBDA_TAGS],
+        )
+    }
     target_save_dir = os.path.join(new_save_dir, "dettime_at_fixed_balacc")
     weighted_save_dir = os.path.join(new_save_dir, "weighted_roc_auc")
     prefix_auc_save_dir = os.path.join(new_save_dir, "prefix_auc_vs_delay")
+    os.makedirs(calib_save_dir, exist_ok=True)
+    os.makedirs(soft_save_dir, exist_ok=True)
+    os.makedirs(alpha_curve_save_dir, exist_ok=True)
+    for metric_save_dir in alpha_metric_save_dirs.values():
+        os.makedirs(metric_save_dir, exist_ok=True)
     os.makedirs(target_save_dir, exist_ok=True)
     os.makedirs(weighted_save_dir, exist_ok=True)
     os.makedirs(prefix_auc_save_dir, exist_ok=True)
@@ -554,6 +910,26 @@ def summary_new_metrics(
 
     with open(os.path.join(new_save_dir, "new_summary.json"), "w") as f:
         json.dump(new_summary, f, indent=2)
+
+    _new_calib_summary_to_df(new_summary).to_csv(
+        os.path.join(calib_save_dir, "new_calib_summary.csv"),
+        index=False,
+    )
+    _new_soft_summary_to_df(new_summary).to_csv(
+        os.path.join(soft_save_dir, "new_soft_summary.csv"),
+        index=False,
+    )
+
+    soft_metric_figs = _get_new_soft_metric_figs(new_summary)
+    for fig_name, fig in soft_metric_figs.items():
+        fig.savefig(os.path.join(soft_save_dir, f"{fig_name}.png"), dpi=400)
+
+    alpha_metric_figs = _get_new_alpha_metric_figs(new_summary)
+    for fig_name, fig in alpha_metric_figs.items():
+        metric_name = _get_alpha_metric_name_from_fig_name(fig_name)
+        target_dir = alpha_metric_save_dirs.get(metric_name, alpha_curve_save_dir)
+        fig.savefig(os.path.join(target_dir, f"{fig_name}.png"), dpi=400)
+    _organize_alpha_metric_root_files(alpha_curve_save_dir, alpha_metric_save_dirs)
 
     target_bal_accs = [0.7, 0.8, 0.9]
     target_figs, target_df = _get_new_target_balacc_figs(new_summary, target_bal_accs)

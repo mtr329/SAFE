@@ -39,6 +39,7 @@ from failure_prob.mrefine.ori_eval import (
 )
 from failure_prob.mrefine.delay_eval import get_delay_metrics
 from failure_prob.mrefine.new_eval import get_new_metrics
+from failure_prob.mrefine.ref_metrics import get_ref_metrics
 
 
 def parse_seeds(seed_cfg: str | int) -> list[int]:
@@ -311,6 +312,14 @@ def evaluate_cfg(cfg: Config) -> None:
                     my_logs["new"],
                 )
 
+                my_logs.setdefault("ref", {})
+                get_ref_metrics(
+                    scores_by_split_name,
+                    rollouts_by_split_name,
+                    metric_name,
+                    my_logs["ref"],
+                )
+
         else:
             if my_logs_save_dir is None:
                 my_logs_save_dir = resolve_eval_output_dir(ckpt_path)
@@ -363,6 +372,14 @@ def evaluate_cfg(cfg: Config) -> None:
                 my_logs["new"],
             )
 
+            my_logs.setdefault("ref", {})
+            get_ref_metrics(
+                scores_by_split_name,
+                rollouts_by_split_name,
+                method_name,
+                my_logs["ref"],
+            )
+
         
     if my_logs_save_dir is None:
         my_logs_save_dir = resolve_eval_output_dir(cfg.train.eval_ckpt_path)
@@ -372,6 +389,7 @@ def evaluate_cfg(cfg: Config) -> None:
         "ori": "ori_logs.json",
         "delay": "delay_logs.json",
         "new": "new_logs.json",
+        "ref": "ref_logs.json",
     }
     for metric_name, filename in metric_log_filenames.items():
         if metric_name not in my_logs:
