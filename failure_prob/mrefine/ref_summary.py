@@ -1,9 +1,13 @@
 import argparse
+import colorsys
 import json
 import os
 
 import numpy as np
 import pandas as pd
+from matplotlib import colormaps
+from matplotlib.colors import to_hex, to_rgb
+from matplotlib.figure import Figure
 from omegaconf import OmegaConf
 
 from failure_prob.mrefine.const import HANDCRAFTED_METHOD_ALLOWLIST
@@ -49,6 +53,50 @@ REF_SELECTION_METRICS = (
     "time_tolerant_f1_tau0p2",
     "time_tolerant_f1_tau0p3",
 )
+
+
+def _get_method_colors(method_names):
+    explicit_method_colors = {
+        "lstm": "#c62828",
+        "indep": "#ff69b4",
+    }
+    fallback_palette = [
+        "#1f77b4",
+        "#ff7f0e",
+        "#2ca02c",
+        "#9467bd",
+        "#8c564b",
+        "#7f7f7f",
+        "#bcbd22",
+        "#17becf",
+        "#e377c2",
+    ]
+
+    method_colors = dict(explicit_method_colors)
+    fallback_methods = [
+        method_name
+        for method_name in sorted(method_names)
+        if method_name not in method_colors
+    ]
+    for i, method_name in enumerate(fallback_methods):
+        method_colors[method_name] = fallback_palette[i % len(fallback_palette)]
+    return method_colors
+
+
+def _adjust_color_lightness(color: str, amount: float) -> str:
+    r, g, b = to_rgb(color)
+    h, l, s = colorsys.rgb_to_hls(r, g, b)
+    l = max(0.0, min(1.0, amount))
+    return to_hex(colorsys.hls_to_rgb(h, l, s))
+
+
+def _get_ordered_palette(num_colors: int, cmap_name: str = "turbo") -> list[str]:
+    if num_colors <= 0:
+        return []
+
+    cmap = colormaps[cmap_name]
+    positions = np.linspace(0.05, 0.95, num_colors)
+    return [to_hex(cmap(pos)) for pos in positions]
 
 
 def _split_ref_logs_by_method(
@@ -311,6 +359,173 @@ def _ref_continuous_summary_to_df(ref_summary: dict) -> pd.DataFrame:
     return df[ordered_columns].sort_values(by=["method", "mode", "delta"]).reset_index(drop=True)
 
 
+def _get_ref_best_metric_figs(best_df: pd.DataFrame) -> dict[str, Figure]:
+    figs = {}
+    if best_df.empty:
+        return figs
+
+    method_colors = _get_method_colors(best_df["method"].unique())
+    metric_names = sorted(best_df["metric"].unique())
+    for metric_name in metric_names:
+        metric_df = best_df[best_df["metric"] == metric_name]
+        fig = Figure(figsize=(12, 5))
+        axes = fig.subplots(1, 2)
+        if not isinstance(axes, np.ndarray):
+            axes = np.asarray([axes])
+
+        for ax, mode in zip(axes, ["early", "last"]):
+            mode_df = metric_df[metric_df["mode"] == mode]
+            has_curve = False
+            for method_name in sorted(mode_df["method"].unique()):
+                method_df = mode_df[mode_df["method"] == method_name].sort_values("delta")
+                if method_df.empty:
+                    continue
+                x = method_df["delta"].astype(float).to_numpy()
+                y = method_df["best_value"].astype(float).to_numpy()
+                if x.size == 0:
+                    continue
+
+                has_curve = True
+                ax.plot(
+                    x,
+                    y,
+                    marker="o",
+                    linewidth=2.0,
+                    markersize=5,
+                    color=method_colors[method_name],
+                    alpha=0.85,
+                    label=method_name,
+                )
+
+            ax.set_xlabel("delay")
+            ax.set_ylabel(metric_name)
+            ax.set_title(mode)
+            ax.set_xlim(left=0.0)
+            ax.set_ylim(0.0, 1.0)
+            ax.grid(True, alpha=0.3)
+            if has_curve:
+                ax.legend(fontsize=8, loc="best", framealpha=0.9, ncol=2)
+
+        fig.suptitle(f"{metric_name}: best-over-alpha vs delay")
+        fig.tight_layout()
+        figs[f"{metric_name}_best_over_alpha_vs_delay"] = fig
+
+    return figs
+
+
+def _get_ref_continuous_metric_figs(continuous_df: pd.DataFrame) -> dict[str, Figure]:
+    figs = {}
+    if continuous_df.empty:
+        return figs
+
+    metric_names = [
+        column
+        for column in continuous_df.columns
+        if column not in ("method", "mode", "delta", "detect_method")
+    ]
+    method_colors = _get_method_colors(continuous_df["method"].unique())
+    for metric_name in metric_names:
+        fig = Figure(figsize=(12, 5))
+        axes = fig.subplots(1, 2)
+        if not isinstance(axes, np.ndarray):
+            axes = np.asarray([axes])
+
+        for ax, mode in zip(axes, ["early", "last"]):
+            mode_df = continuous_df[continuous_df["mode"] == mode]
+            has_curve = False
+            for method_name in sorted(mode_df["method"].unique()):
+                method_df = mode_df[mode_df["method"] == method_name].sort_values("delta")
+                if method_df.empty or metric_name not in method_df.columns:
+                    continue
+                x = method_df["delta"].astype(float).to_numpy()
+                y = method_df[metric_name].astype(float).to_numpy()
+                if x.size == 0:
+                    continue
+
+                has_curve = True
+                ax.plot(
+                    x,
+                    y,
+                    marker="o",
+                    linewidth=2.0,
+                    markersize=5,
+                    color=method_colors[method_name],
+                    alpha=0.85,
+                    label=method_name,
+                )
+
+            ax.set_xlabel("delay")
+            ax.set_ylabel(metric_name)
+            ax.set_title(mode)
+            ax.set_xlim(left=0.0)
+            ax.set_ylim(0.0, 1.0)
+            ax.grid(True, alpha=0.3)
+            if has_curve:
+                ax.legend(fontsize=8, loc="best", framealpha=0.9, ncol=2)
+
+        fig.suptitle(f"{metric_name}: continuous score vs delay")
+        fig.tight_layout()
+        figs[f"{metric_name}_vs_delay"] = fig
+
+    return figs
+
+
+def _get_ref_nab_profile_figs(best_df: pd.DataFrame) -> dict[str, Figure]:
+    figs = {}
+    if best_df.empty:
+        return figs
+
+    nab_metrics = [m for m in ("nab_standard", "nab_reward_low_fp", "nab_reward_low_fn") if m in best_df["metric"].unique()]
+    if not nab_metrics:
+        return figs
+
+    palette = _get_ordered_palette(len(nab_metrics), cmap_name="cividis")
+    for method_name in sorted(best_df["method"].unique()):
+        fig = Figure(figsize=(12, 5))
+        axes = fig.subplots(1, 2)
+        if not isinstance(axes, np.ndarray):
+            axes = np.asarray([axes])
+        base_color = _get_method_colors([method_name])[method_name]
+
+        for ax, mode in zip(axes, ["early", "last"]):
+            mode_df = best_df[(best_df["method"] == method_name) & (best_df["mode"] == mode)]
+            has_curve = False
+            for i, metric_name in enumerate(nab_metrics):
+                metric_df = mode_df[mode_df["metric"] == metric_name].sort_values("delta")
+                if metric_df.empty:
+                    continue
+                has_curve = True
+                color = _adjust_color_lightness(
+                    base_color if len(nab_metrics) == 1 else palette[i],
+                    0.35 + 0.45 * (i + 1) / max(len(nab_metrics), 1),
+                )
+                ax.plot(
+                    metric_df["delta"].astype(float).to_numpy(),
+                    metric_df["best_value"].astype(float).to_numpy(),
+                    marker="o",
+                    linewidth=2.0,
+                    markersize=4,
+                    color=color,
+                    alpha=0.9,
+                    label=metric_name,
+                )
+
+            ax.set_xlabel("delay")
+            ax.set_ylabel("NAB")
+            ax.set_title(mode)
+            ax.set_xlim(left=0.0)
+            ax.set_ylim(0.0, 1.0)
+            ax.grid(True, alpha=0.3)
+            if has_curve:
+                ax.legend(fontsize=8, loc="best", framealpha=0.9)
+
+        fig.suptitle(f"{method_name}: NAB profiles vs delay")
+        fig.tight_layout()
+        figs[f"{method_name}_nab_profiles_vs_delay"] = fig
+
+    return figs
+
+
 def summary_ref_metrics(
     logs_dir="logs",
     save_dir=None,
@@ -323,9 +538,15 @@ def summary_ref_metrics(
     calib_save_dir = os.path.join(ref_save_dir, "calib")
     continuous_save_dir = os.path.join(ref_save_dir, "continuous")
     best_save_dir = os.path.join(ref_save_dir, "best_over_alpha")
+    best_fig_save_dir = os.path.join(ref_save_dir, "best_over_alpha_vs_delay")
+    continuous_fig_save_dir = os.path.join(ref_save_dir, "continuous_vs_delay")
+    nab_profile_save_dir = os.path.join(ref_save_dir, "nab_profiles_vs_delay")
     os.makedirs(calib_save_dir, exist_ok=True)
     os.makedirs(continuous_save_dir, exist_ok=True)
     os.makedirs(best_save_dir, exist_ok=True)
+    os.makedirs(best_fig_save_dir, exist_ok=True)
+    os.makedirs(continuous_fig_save_dir, exist_ok=True)
+    os.makedirs(nab_profile_save_dir, exist_ok=True)
 
     ref_logs_by_method = {}
     for log_path in _collect_ref_log_paths(logs_dir):
@@ -372,10 +593,16 @@ def summary_ref_metrics(
         index=False,
     )
 
-    _best_rows_by_metric(ref_calib_df, REF_SELECTION_METRICS).to_csv(
-        os.path.join(best_save_dir, "ref_best_over_alpha.csv"),
-        index=False,
-    )
+    best_df = _best_rows_by_metric(ref_calib_df, REF_SELECTION_METRICS)
+    best_df.to_csv(os.path.join(best_save_dir, "ref_best_over_alpha.csv"), index=False)
+
+    continuous_df = _ref_continuous_summary_to_df(ref_summary)
+    for fig_name, fig in _get_ref_best_metric_figs(best_df).items():
+        fig.savefig(os.path.join(best_fig_save_dir, f"{fig_name}.png"), dpi=400)
+    for fig_name, fig in _get_ref_continuous_metric_figs(continuous_df).items():
+        fig.savefig(os.path.join(continuous_fig_save_dir, f"{fig_name}.png"), dpi=400)
+    for fig_name, fig in _get_ref_nab_profile_figs(best_df).items():
+        fig.savefig(os.path.join(nab_profile_save_dir, f"{fig_name}.png"), dpi=400)
 
     return ref_summary
 
