@@ -22,6 +22,11 @@ class DatasetConfig:
     data_path: Any = MISSING
     # If set, unseen tasks will be loaded from this path.
     data_path_unseen: Any = None
+
+    use_cache: bool = False
+    refresh_cache: bool = False
+    cache_path: Optional[str] = None
+    cache_dir: str = "./dataset_cache"
     
     load_to_cuda: bool = True
     

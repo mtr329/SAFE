@@ -261,6 +261,7 @@ def evaluate_cfg(cfg: Config) -> None:
             print("Loading split signature from", os.path.abspath(split_path))
             split_signature = load_split_signature(split_path)
             split_md5 = validate_split_signature(
+                cfg,
                 rollouts_by_split_name,
                 split_signature,
             )

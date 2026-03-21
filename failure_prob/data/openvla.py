@@ -123,6 +123,7 @@ def load_rollouts(cfg: Config) -> list[Rollout]:
                 
             hidden_states = hidden_states.float() # (n_step, n_token, d)
             hidden_states = process_tensor_idx_rel(hidden_states, cfg.dataset.token_idx_rel) # (n_step, d')
+            cfg.dataset.dim_features = hidden_states.shape[-1]
         else:
             file_name = os.path.basename(csv_path)
             task_id, episode_id, success = extract_info_from_path(file_name)
@@ -135,6 +136,7 @@ def load_rollouts(cfg: Config) -> list[Rollout]:
             }
             rollout_length = len(df_metrics)
             hidden_states = torch.zeros((rollout_length, 1))
+            cfg.dataset.dim_features = hidden_states.shape[-1]
             action_vectors = None
         
         r = Rollout(
@@ -155,7 +157,7 @@ def load_rollouts(cfg: Config) -> list[Rollout]:
     print(f"Loaded {len(all_rollouts)} rollouts")
     
     all_rollouts = set_task_min_step(all_rollouts)
-        
+
     return all_rollouts
 
 

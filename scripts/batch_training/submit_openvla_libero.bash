@@ -8,36 +8,36 @@ SAFE_OPENVLA_ROLLOUT_ROOT=/data1/mtr/data/safe_rollouts/openvla/
 
 
 # LSTM and MLP
-# for SUITE_NAME in 10; do
-# for SEED in 0 1 2; do
-    # python -m failure_prob.train \
-    #     --multirun \
-    #     train.wandb_group_name=${GROUP_NAME} \
-    #     dataset=openvla_libero_${SUITE_NAME} \
-    #     dataset.data_path_prefix=${SAFE_OPENVLA_ROLLOUT_ROOT} \
-    #     dataset.token_idx_rel=1.0 \
-    #     dataset.load_to_cuda=False \
-    #     model=lstm \
-    #     model.batch_size=64,512 \
-    #     model.lr=1e-4 \
-    #     model.lambda_reg=1 \
-    #     train.seed=${SEED} \
-    #     train.exp_suffix=lstm
-    # python -m failure_prob.train \
-    #     --multirun \
-    #     train.wandb_group_name=${GROUP_NAME} \
-    #     dataset=openvla_libero_${SUITE_NAME} \
-    #     dataset.data_path_prefix=${SAFE_OPENVLA_ROLLOUT_ROOT} \
-    #     dataset.token_idx_rel=1.0 \
-    #     dataset.load_to_cuda=False \
-    #     model=indep \
-    #     model.batch_size=64,128 \
-    #     model.lr=1e-4 \
-    #     model.lambda_reg=1e-2 \
-    #     train.seed=${SEED} \
-    #     train.exp_suffix=mlp
-# done
-# done
+for SUITE_NAME in 10; do
+for SEED in 0 1 2; do
+    python -m failure_prob.train \
+        --multirun \
+        train.wandb_group_name=${GROUP_NAME} \
+        dataset=openvla_libero_${SUITE_NAME} \
+        dataset.data_path_prefix=${SAFE_OPENVLA_ROLLOUT_ROOT} \
+        dataset.token_idx_rel=1.0 \
+        dataset.load_to_cuda=False \
+        model=lstm \
+        model.batch_size=64,512 \
+        model.lr=1e-4 \
+        model.lambda_reg=1 \
+        train.seed=${SEED} \
+        train.exp_suffix=lstm
+    python -m failure_prob.train \
+        --multirun \
+        train.wandb_group_name=${GROUP_NAME} \
+        dataset=openvla_libero_${SUITE_NAME} \
+        dataset.data_path_prefix=${SAFE_OPENVLA_ROLLOUT_ROOT} \
+        dataset.token_idx_rel=1.0 \
+        dataset.load_to_cuda=False \
+        model=indep \
+        model.batch_size=64,128 \
+        model.lr=1e-4 \
+        model.lambda_reg=1e-2 \
+        train.seed=${SEED} \
+        train.exp_suffix=mlp
+done
+done
 
 # # Embedding-based method
 # for SUITE_NAME in 10; do

@@ -163,3 +163,4 @@ slurm_logs
 /setup_envs.bash
 log_*/
 wandb_*/
+dataset_cache/

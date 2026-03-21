@@ -95,7 +95,7 @@ def main(cfg: Config) -> None:
             cfg.train.logs_save_path,
             f"split_seed{seed}.json",
         )
-        split_signature = save_split_signature(split_save_path, rollouts_by_split_name)
+        split_signature = save_split_signature(split_save_path, cfg, rollouts_by_split_name)
         print(
             "Saving split signature to",
             os.path.abspath(split_save_path),
