@@ -14,6 +14,10 @@ from failure_prob.mrefine.const import HANDCRAFTED_METHOD_ALLOWLIST
 
 PARETO_TARGET_BAL_ACCS = np.round(np.arange(0.55, 0.96, 0.05), 2).tolist()
 PARETO_BAL_ACC_RANGE = (0.55, 0.95)
+AUTO_COMMON_BAL_ACC_MIN_CURVE_FRACTION = 0.8
+AUTO_COMMON_BAL_ACC_GRID_STEP = 0.01
+AUTO_COMMON_BAL_ACC_NUM_TARGETS = 9
+PENALIZED_DET_TIME = 1.0
 
 
 def _split_delay_logs_by_method(
@@ -588,6 +592,191 @@ def _compute_max_bal_acc_from_pareto(
     if pareto_bal_accs.size == 0:
         return np.nan
     return float(np.max(pareto_bal_accs))
+
+
+def _collect_pareto_balacc_intervals(
+    delay_summary: dict,
+    mode: str,
+) -> list[dict]:
+    intervals = []
+    for method_name, summary in sorted(delay_summary.items()):
+        delta_dict = summary.get("calib", {}).get(mode, {})
+        for delta, alpha_dict in sorted(delta_dict.items(), key=lambda x: float(x[0])):
+            pareto_det_times, pareto_bal_accs = _get_pareto_curve_from_alpha_dict(alpha_dict)
+            if pareto_det_times.size == 0 or pareto_bal_accs.size == 0:
+                continue
+            intervals.append({
+                "method": method_name,
+                "delta": float(delta),
+                "bal_acc_min": float(np.min(pareto_bal_accs)),
+                "bal_acc_max": float(np.max(pareto_bal_accs)),
+            })
+    return intervals
+
+
+def _select_auto_common_balacc_ranges(
+    delay_summary: dict,
+    min_curve_fraction: float = AUTO_COMMON_BAL_ACC_MIN_CURVE_FRACTION,
+    grid_step: float = AUTO_COMMON_BAL_ACC_GRID_STEP,
+) -> dict[str, dict]:
+    range_stats = {}
+
+    for mode in ("early", "last"):
+        intervals = _collect_pareto_balacc_intervals(delay_summary, mode)
+        default_stats = {
+            "mode": mode,
+            "curve_fraction_target": float(min_curve_fraction),
+            "curve_fraction_achieved": 0.0,
+            "num_curves": 0,
+            "bal_acc_min": np.nan,
+            "bal_acc_max": np.nan,
+            "bal_acc_width": 0.0,
+        }
+        if not intervals:
+            range_stats[mode] = default_stats
+            continue
+
+        mins = np.asarray([interval["bal_acc_min"] for interval in intervals], dtype=float)
+        maxs = np.asarray([interval["bal_acc_max"] for interval in intervals], dtype=float)
+        global_min = float(np.min(mins))
+        global_max = float(np.max(maxs))
+        if global_max <= global_min:
+            stats = dict(default_stats)
+            stats.update({
+                "curve_fraction_achieved": 1.0,
+                "num_curves": len(intervals),
+                "bal_acc_min": global_min,
+                "bal_acc_max": global_max,
+            })
+            range_stats[mode] = stats
+            continue
+
+        lo_start = np.floor(global_min / grid_step) * grid_step
+        hi_end = np.ceil(global_max / grid_step) * grid_step
+        grid = np.round(np.arange(lo_start, hi_end + 0.5 * grid_step, grid_step), 6)
+
+        best_candidate = None
+        fallback_candidate = None
+        num_curves = len(intervals)
+        for lo in grid:
+            for hi in grid:
+                if hi <= lo:
+                    continue
+                covered = np.logical_and(mins <= lo, maxs >= hi)
+                curve_fraction = float(np.mean(covered))
+                width = float(hi - lo)
+                candidate = (curve_fraction, width, float(hi), -float(lo))
+                if fallback_candidate is None or candidate > fallback_candidate[0]:
+                    fallback_candidate = (
+                        candidate,
+                        {
+                            "mode": mode,
+                            "curve_fraction_target": float(min_curve_fraction),
+                            "curve_fraction_achieved": curve_fraction,
+                            "num_curves": num_curves,
+                            "bal_acc_min": float(lo),
+                            "bal_acc_max": float(hi),
+                            "bal_acc_width": width,
+                        },
+                    )
+                if curve_fraction + 1e-12 < min_curve_fraction:
+                    continue
+                best_key = (width, curve_fraction, float(hi), -float(lo))
+                if best_candidate is None or best_key > best_candidate[0]:
+                    best_candidate = (
+                        best_key,
+                        {
+                            "mode": mode,
+                            "curve_fraction_target": float(min_curve_fraction),
+                            "curve_fraction_achieved": curve_fraction,
+                            "num_curves": num_curves,
+                            "bal_acc_min": float(lo),
+                            "bal_acc_max": float(hi),
+                            "bal_acc_width": width,
+                        },
+                    )
+
+        if best_candidate is not None:
+            range_stats[mode] = best_candidate[1]
+        elif fallback_candidate is not None:
+            range_stats[mode] = fallback_candidate[1]
+        else:
+            range_stats[mode] = default_stats
+
+    return range_stats
+
+
+def _auto_common_balacc_range_to_df(
+    range_stats: dict[str, dict],
+) -> pd.DataFrame:
+    rows = [range_stats[mode] for mode in ("early", "last") if mode in range_stats]
+    if not rows:
+        return pd.DataFrame(
+            columns=[
+                "mode",
+                "curve_fraction_target",
+                "curve_fraction_achieved",
+                "num_curves",
+                "bal_acc_min",
+                "bal_acc_max",
+                "bal_acc_width",
+            ]
+        )
+
+    df = pd.DataFrame(rows)
+    return df.sort_values(by=["mode"]).reset_index(drop=True)
+
+
+def _get_auto_target_bal_accs(
+    bal_acc_min: float,
+    bal_acc_max: float,
+    num_targets: int = AUTO_COMMON_BAL_ACC_NUM_TARGETS,
+) -> list[float]:
+    if not np.isfinite(bal_acc_min) or not np.isfinite(bal_acc_max) or bal_acc_max <= bal_acc_min:
+        return []
+    if num_targets <= 1:
+        return [float(bal_acc_min)]
+    return np.round(np.linspace(bal_acc_min, bal_acc_max, num_targets), 3).tolist()
+
+
+def _interp_penalized_det_time_on_pareto_for_bal_acc(
+    pareto_det_times: np.ndarray,
+    pareto_bal_accs: np.ndarray,
+    target_bal_acc: float,
+    penalty_det_time: float = PENALIZED_DET_TIME,
+) -> float:
+    det_time = _interp_det_time_on_pareto_for_bal_acc(
+        pareto_det_times,
+        pareto_bal_accs,
+        target_bal_acc,
+    )
+    if np.isnan(det_time):
+        return float(penalty_det_time)
+    return float(det_time)
+
+
+def _compute_penalized_mean_t_at_balacc(
+    pareto_det_times: np.ndarray,
+    pareto_bal_accs: np.ndarray,
+    bal_acc_min: float,
+    bal_acc_max: float,
+    penalty_det_time: float = PENALIZED_DET_TIME,
+    num_points: int = 201,
+) -> float:
+    if not np.isfinite(bal_acc_min) or not np.isfinite(bal_acc_max) or bal_acc_max <= bal_acc_min:
+        return np.nan
+
+    bal_acc_grid = np.linspace(float(bal_acc_min), float(bal_acc_max), max(int(num_points), 2))
+    det_times = np.asarray([
+        _interp_penalized_det_time_on_pareto_for_bal_acc(
+            pareto_det_times,
+            pareto_bal_accs,
+            float(target_bal_acc),
+            penalty_det_time=penalty_det_time,
+        )
+        for target_bal_acc in bal_acc_grid
+    ], dtype=float)
+    return float(np.trapezoid(det_times, bal_acc_grid) / (bal_acc_max - bal_acc_min))
 
 
 def _get_delay_roc_prc_figs(
@@ -1493,6 +1682,272 @@ def _get_delay_max_bal_acc_from_pareto_figs(
     return figs, max_bal_acc_df
 
 
+def _get_delay_auto_common_balacc_range_figs(
+    delay_summary: dict,
+    range_stats: dict[str, dict],
+) -> dict[str, Figure]:
+    fig = Figure(figsize=(12, 5))
+    axes = fig.subplots(1, 2)
+    if not isinstance(axes, np.ndarray):
+        axes = np.asarray([axes])
+
+    method_colors = _get_method_colors(delay_summary.keys())
+    for ax, mode in zip(axes, ["early", "last"]):
+        intervals = _collect_pareto_balacc_intervals(delay_summary, mode)
+        if not intervals:
+            ax.set_title(mode)
+            ax.text(0.5, 0.5, "no pareto curves", ha="center", va="center", transform=ax.transAxes)
+            ax.set_axis_off()
+            continue
+
+        for idx, interval in enumerate(intervals):
+            ax.hlines(
+                y=idx,
+                xmin=interval["bal_acc_min"],
+                xmax=interval["bal_acc_max"],
+                color=method_colors[interval["method"]],
+                linewidth=2.0,
+                alpha=0.65,
+            )
+
+        stats = range_stats.get(mode, {})
+        range_min = stats.get("bal_acc_min")
+        range_max = stats.get("bal_acc_max")
+        if np.isfinite(range_min) and np.isfinite(range_max) and range_max > range_min:
+            ax.axvspan(range_min, range_max, color="#111111", alpha=0.12)
+            ax.axvline(range_min, color="#111111", linewidth=1.5, alpha=0.9)
+            ax.axvline(range_max, color="#111111", linewidth=1.5, alpha=0.9)
+            ax.text(
+                0.02,
+                0.98,
+                (
+                    f"auto range [{range_min:.2f}, {range_max:.2f}]\n"
+                    f"curve coverage={stats.get('curve_fraction_achieved', np.nan):.2f}"
+                ),
+                ha="left",
+                va="top",
+                transform=ax.transAxes,
+                fontsize=9,
+                bbox={"facecolor": "white", "edgecolor": "none", "alpha": 0.75},
+            )
+
+        ax.set_xlabel("bal_acc")
+        ax.set_ylabel("pareto curve index")
+        ax.set_title(mode)
+        ax.set_xlim(0.0, 1.0)
+        ax.grid(True, axis="x", alpha=0.3)
+
+    handles = []
+    labels = []
+    for method_name, color in method_colors.items():
+        handles.append(axes[0].plot([], [], color=color, linewidth=3.0, label=method_name)[0])
+        labels.append(method_name)
+    if handles:
+        fig.legend(handles, labels, fontsize=8, loc="lower center", framealpha=0.9, ncol=4)
+    fig.suptitle("Auto-selected common BalAcc ranges across delay pareto curves")
+    fig.tight_layout(rect=(0.0, 0.06, 1.0, 1.0))
+    return {"auto_common_balacc_range": fig}
+
+
+def _get_delay_penalized_t_at_balacc_figs(
+    delay_summary: dict,
+    range_stats: dict[str, dict],
+    penalty_det_time: float = PENALIZED_DET_TIME,
+) -> tuple[dict[str, Figure], pd.DataFrame]:
+    figs = {}
+    rows = []
+
+    for method_name, summary in sorted(delay_summary.items()):
+        fig = Figure(figsize=(12, 5))
+        axes = fig.subplots(1, 2)
+        if not isinstance(axes, np.ndarray):
+            axes = np.asarray([axes])
+
+        for ax, mode in zip(axes, ["early", "last"]):
+            stats = range_stats.get(mode, {})
+            target_bal_accs = _get_auto_target_bal_accs(
+                stats.get("bal_acc_min", np.nan),
+                stats.get("bal_acc_max", np.nan),
+            )
+            delta_dict = summary.get("calib", {}).get(mode, {})
+            deltas = sorted(delta_dict.keys(), key=float)
+            x = [float(delta) for delta in deltas]
+            palette = _get_ordered_palette(len(target_bal_accs), cmap_name="plasma")
+            has_curve = False
+
+            for i, target_bal_acc in enumerate(target_bal_accs):
+                y = []
+                for delta in deltas:
+                    pareto_det_times, pareto_bal_accs = _get_pareto_curve_from_alpha_dict(delta_dict[delta])
+                    raw_det_time = _interp_det_time_on_pareto_for_bal_acc(
+                        pareto_det_times,
+                        pareto_bal_accs,
+                        target_bal_acc,
+                    )
+                    penalized_det_time = _interp_penalized_det_time_on_pareto_for_bal_acc(
+                        pareto_det_times,
+                        pareto_bal_accs,
+                        target_bal_acc,
+                        penalty_det_time=penalty_det_time,
+                    )
+                    y.append(penalized_det_time)
+                    rows.append({
+                        "method": method_name,
+                        "mode": mode,
+                        "delta": float(delta),
+                        "target_bal_acc": float(target_bal_acc),
+                        "auto_bal_acc_min": stats.get("bal_acc_min", np.nan),
+                        "auto_bal_acc_max": stats.get("bal_acc_max", np.nan),
+                        "penalty_det_time": float(penalty_det_time),
+                        "penalized_avg_det_time": float(penalized_det_time),
+                        "is_penalized": bool(np.isnan(raw_det_time)),
+                    })
+
+                if not y:
+                    continue
+
+                has_curve = True
+                ax.plot(
+                    x,
+                    y,
+                    marker="o",
+                    linewidth=2.0,
+                    markersize=4,
+                    color=palette[i % len(palette)],
+                    alpha=0.9,
+                    label=f"bal_acc={target_bal_acc:.2f}",
+                )
+
+            ax.set_xlabel("delay")
+            ax.set_ylabel("penalized_avg_det_time")
+            ax.set_title(mode)
+            ax.set_xlim(left=0.0)
+            ax.set_ylim(0.0, max(1.0, penalty_det_time))
+            ax.grid(True, alpha=0.3)
+            if has_curve:
+                ax.legend(fontsize=8, loc="best", framealpha=0.9, ncol=2)
+
+        fig.suptitle(f"{method_name}: penalized T@BalAcc on auto common range")
+        fig.tight_layout()
+        figs[f"{method_name}_penalized_t_at_balacc"] = fig
+
+    target_df = pd.DataFrame(rows)
+    if not target_df.empty:
+        target_df = target_df.sort_values(
+            by=["method", "mode", "target_bal_acc", "delta"]
+        ).reset_index(drop=True)
+    else:
+        target_df = pd.DataFrame(
+            columns=[
+                "method",
+                "mode",
+                "delta",
+                "target_bal_acc",
+                "auto_bal_acc_min",
+                "auto_bal_acc_max",
+                "penalty_det_time",
+                "penalized_avg_det_time",
+                "is_penalized",
+            ]
+        )
+    return figs, target_df
+
+
+def _get_delay_penalized_mean_t_at_balacc_figs(
+    delay_summary: dict,
+    range_stats: dict[str, dict],
+    penalty_det_time: float = PENALIZED_DET_TIME,
+) -> tuple[dict[str, Figure], pd.DataFrame]:
+    figs = {}
+    rows = []
+    method_colors = _get_method_colors(delay_summary.keys())
+
+    for mode in ["early", "last"]:
+        fig = Figure(figsize=(7, 5))
+        ax = fig.subplots()
+        has_curve = False
+        stats = range_stats.get(mode, {})
+        range_min = stats.get("bal_acc_min", np.nan)
+        range_max = stats.get("bal_acc_max", np.nan)
+
+        for method_name, summary in sorted(delay_summary.items()):
+            delta_dict = summary.get("calib", {}).get(mode, {})
+            deltas = sorted(delta_dict.keys(), key=float)
+            x = []
+            y = []
+
+            for delta in deltas:
+                pareto_det_times, pareto_bal_accs = _get_pareto_curve_from_alpha_dict(delta_dict[delta])
+                penalized_mean_t = _compute_penalized_mean_t_at_balacc(
+                    pareto_det_times,
+                    pareto_bal_accs,
+                    range_min,
+                    range_max,
+                    penalty_det_time=penalty_det_time,
+                )
+                x.append(float(delta))
+                y.append(penalized_mean_t)
+                rows.append({
+                    "method": method_name,
+                    "mode": mode,
+                    "delta": float(delta),
+                    "auto_bal_acc_min": range_min,
+                    "auto_bal_acc_max": range_max,
+                    "penalty_det_time": float(penalty_det_time),
+                    "penalized_mean_t_at_balacc": penalized_mean_t,
+                })
+
+            valid_pairs = [(dx, dy) for dx, dy in zip(x, y) if not np.isnan(dy)]
+            if not valid_pairs:
+                continue
+
+            has_curve = True
+            ax.plot(
+                [pair[0] for pair in valid_pairs],
+                [pair[1] for pair in valid_pairs],
+                marker="o",
+                linewidth=2.0,
+                markersize=5,
+                color=method_colors[method_name],
+                alpha=0.9,
+                label=method_name,
+            )
+
+        ax.set_xlabel("delay")
+        ax.set_ylabel("penalized_mean_t_at_balacc")
+        ax.set_title(
+            f"{mode} [{range_min:.2f}, {range_max:.2f}]"
+            if np.isfinite(range_min) and np.isfinite(range_max)
+            else mode
+        )
+        ax.set_xlim(left=0.0)
+        ax.set_ylim(0.0, max(1.0, penalty_det_time))
+        ax.grid(True, alpha=0.3)
+        if has_curve:
+            ax.legend(fontsize=8, loc="best", framealpha=0.9, ncol=2)
+        fig.tight_layout()
+        figs[f"penalized_mean_t_at_balacc_{mode}"] = fig
+
+    penalized_df = pd.DataFrame(rows)
+    if not penalized_df.empty:
+        penalized_df = penalized_df.sort_values(
+            by=["method", "mode", "delta"]
+        ).reset_index(drop=True)
+    else:
+        penalized_df = pd.DataFrame(
+            columns=[
+                "method",
+                "mode",
+                "delta",
+                "auto_bal_acc_min",
+                "auto_bal_acc_max",
+                "penalty_det_time",
+                "penalized_mean_t_at_balacc",
+            ]
+        )
+    return figs, penalized_df
+
+
 def summary_delay_metrics(
     logs_dir="logs",
     save_dir=None,
@@ -1520,6 +1975,9 @@ def summary_delay_metrics(
     pareto_fixed_range_autc_save_dir = os.path.join(delay_save_dir, "fixed_range_autc_from_pareto")
     pareto_coverage_save_dir = os.path.join(delay_save_dir, "pareto_coverage")
     pareto_max_bal_acc_save_dir = os.path.join(delay_save_dir, "max_bal_acc_from_pareto")
+    auto_range_save_dir = os.path.join(delay_save_dir, "auto_common_balacc_range")
+    penalized_t_save_dir = os.path.join(delay_save_dir, "penalized_t_at_balacc")
+    penalized_mean_t_save_dir = os.path.join(delay_save_dir, "penalized_mean_t_at_balacc")
     os.makedirs(static_save_dir, exist_ok=True)
     os.makedirs(roc_prc_save_dir, exist_ok=True)
     os.makedirs(curve_save_dir, exist_ok=True)
@@ -1535,6 +1993,9 @@ def summary_delay_metrics(
     os.makedirs(pareto_fixed_range_autc_save_dir, exist_ok=True)
     os.makedirs(pareto_coverage_save_dir, exist_ok=True)
     os.makedirs(pareto_max_bal_acc_save_dir, exist_ok=True)
+    os.makedirs(auto_range_save_dir, exist_ok=True)
+    os.makedirs(penalized_t_save_dir, exist_ok=True)
+    os.makedirs(penalized_mean_t_save_dir, exist_ok=True)
 
     delay_logs_by_method = {}
     log_paths = _collect_delay_log_paths(logs_dir)
@@ -1695,6 +2156,37 @@ def summary_delay_metrics(
     )
     for fig_name, fig in pareto_max_bal_acc_figs.items():
         fig.savefig(os.path.join(pareto_max_bal_acc_save_dir, f"{fig_name}.png"), dpi=400)
+
+    auto_range_stats = _select_auto_common_balacc_ranges(delay_summary)
+    _auto_common_balacc_range_to_df(auto_range_stats).to_csv(
+        os.path.join(auto_range_save_dir, "delay_auto_common_balacc_range.csv"),
+        index=False,
+    )
+    auto_range_figs = _get_delay_auto_common_balacc_range_figs(delay_summary, auto_range_stats)
+    for fig_name, fig in auto_range_figs.items():
+        fig.savefig(os.path.join(auto_range_save_dir, f"{fig_name}.png"), dpi=400)
+
+    penalized_t_figs, penalized_t_df = _get_delay_penalized_t_at_balacc_figs(
+        delay_summary,
+        auto_range_stats,
+    )
+    penalized_t_df.to_csv(
+        os.path.join(penalized_t_save_dir, "delay_penalized_t_at_balacc.csv"),
+        index=False,
+    )
+    for fig_name, fig in penalized_t_figs.items():
+        fig.savefig(os.path.join(penalized_t_save_dir, f"{fig_name}.png"), dpi=400)
+
+    penalized_mean_t_figs, penalized_mean_t_df = _get_delay_penalized_mean_t_at_balacc_figs(
+        delay_summary,
+        auto_range_stats,
+    )
+    penalized_mean_t_df.to_csv(
+        os.path.join(penalized_mean_t_save_dir, "delay_penalized_mean_t_at_balacc.csv"),
+        index=False,
+    )
+    for fig_name, fig in penalized_mean_t_figs.items():
+        fig.savefig(os.path.join(penalized_mean_t_save_dir, f"{fig_name}.png"), dpi=400)
 
     return delay_summary
 
