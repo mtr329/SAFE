@@ -108,6 +108,7 @@ def build_split_signature(
         "signature_md5": signature_md5,
         "split_counts": split_counts,
         "split_tasks": split_tasks,
+        "splits": splits,
         "data_payload": data_payload,
     }
 
@@ -131,6 +132,35 @@ def load_split_signature(split_path: str) -> dict:
     if "split_md5" not in signature:
         raise ValueError(f"Invalid split signature format: {split_path}")
     return signature
+
+
+def restore_rollouts_by_split_signature(
+    all_rollouts: list[Rollout],
+    signature: dict,
+) -> dict[str, list[Rollout]] | None:
+    splits = signature.get("splits")
+    if not splits:
+        return None
+
+    rollout_buckets = {}
+    for rollout in all_rollouts:
+        record = _rollout_signature_record(rollout)
+        key = json.dumps(record, sort_keys=True, separators=(",", ":"))
+        rollout_buckets.setdefault(key, []).append(rollout)
+
+    restored = {}
+    for split_name, records in splits.items():
+        restored_rollouts = []
+        for record in records:
+            key = json.dumps(record, sort_keys=True, separators=(",", ":"))
+            bucket = rollout_buckets.get(key)
+            if not bucket:
+                raise ValueError(
+                    f"Saved split rollout not found in loaded data for split '{split_name}': {record}"
+                )
+            restored_rollouts.append(bucket.pop())
+        restored[split_name] = restored_rollouts
+    return restored
 
 
 def validate_split_signature(

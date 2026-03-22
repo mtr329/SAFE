@@ -20,14 +20,14 @@ resolve_default_logs_dir() {
         return
     fi
 
-    for candidate in log_ckpt logs; do
+    for candidate in log_ckpt_new log_ckpt logs; do
         if [ -d "${candidate}" ]; then
             printf '%s\n' "${candidate}"
             return
         fi
     done
 
-    echo "Could not find a default logs directory. Tried: log_ckpt, logs" >&2
+    echo "Could not find a default logs directory. Tried: log_ckpt_new, log_ckpt, logs" >&2
     exit 1
 }
 

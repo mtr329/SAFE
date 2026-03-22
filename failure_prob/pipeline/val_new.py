@@ -1,464 +1,467 @@
 import argparse
-import hashlib
 import json
 import os
-import re
 import sys
+import traceback
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
+import torch
+from matplotlib.figure import Figure
 from omegaconf import OmegaConf
+from torch.utils.data import DataLoader
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from failure_prob.mrefine.delay_summary import (
-    PENALIZED_DET_TIME,
-    _compute_max_bal_acc_from_pareto,
-    _compute_pareto_balacc_coverage,
-    _compute_penalized_mean_t_at_balacc,
-    _get_pareto_curve_from_alpha_dict,
-    _select_auto_common_balacc_ranges,
+from failure_prob.conf import Config, process_cfg
+from failure_prob.data import load_rollouts, split_rollouts
+from failure_prob.data.utils import RolloutDataset, normalize_rollouts_hidden_states
+from failure_prob.eval import (
+    collect_eval_dirs,
+    load_model_checkpoint,
+    parse_seeds,
+    resolve_ckpt_path,
+    resolve_split_path,
+    to_jsonable,
 )
-from failure_prob.mrefine.new_summary import (
-    _collect_new_log_paths,
-    _get_run_meta_from_config,
-    _split_new_logs_by_method,
-    _summarize_new_calib,
+from failure_prob.model import get_model
+from failure_prob.model.base import BaseModel
+from failure_prob.mrefine.new_eval import _get_delay_calib_res, _get_new_static_metrics
+from failure_prob.mrefine.ori_eval import get_ori_metrics
+from failure_prob.mrefine.utils import get_func_conformal_bands
+from failure_prob.utils.constants import MANUAL_METRICS
+from failure_prob.utils.metrics import get_metrics_curve
+from failure_prob.utils.random import seed_everything
+from failure_prob.utils.routines import model_forward_dataloader
+from failure_prob.utils.split_io import (
+    load_split_signature,
+    restore_rollouts_by_split_signature,
+    validate_split_signature,
 )
+from failure_prob.utils.timer import Timer
 
-IGNORED_DATASET_FIELDS = {
-    "data_path",
-    "data_path_prefix",
-    "data_path_unseen",
-    "use_cache",
-    "refresh_cache",
-    "cache_path",
-    "cache_dir",
-    "load_to_cuda",
-    "normalize_hidden_states",
-    "pred_horizon",
-    "exec_horizon",
-    "unseen_task_ratio",
-    "seen_train_ratio",
-    "dim_features",
-    "dim_action",
-    "failure_time_label_path",
-}
-
-IGNORED_TRAIN_FIELDS = {
-    "seed",
-    "wandb_project",
-    "wandb_dir",
-    "wandb_group_name",
-    "exp_name",
-    "debug",
-    "vis_every",
-    "roc_every",
-    "eval_save_video",
-    "eval_save_video_functional",
-    "eval_save_video_multiproc",
-    "eval_save_timing_plots",
-    "eval_save_logs",
-    "eval_save_ckpt",
-    "eval_ckpt_path",
-    "eval_split_path",
-    "logs_save_root",
-    "logs_save_path",
-}
+VAL_SPLITS = ("train", "val_seen", "val_unseen")
+ALPHAS = [0.02, 0.05, 0.1, 0.15, 0.2, 0.25, 0.3, 0.35, 0.4, 0.45, 0.5, 0.6, 0.7, 0.8, 0.9]
 
 
 def _resolve_default_logs_dir() -> str:
     repo_root = Path(__file__).resolve().parents[2]
-    for dirname in ("log_ckpt", "logs"):
+    for dirname in ("log_ckpt_new", "log_ckpt", "logs"):
         candidate = repo_root / dirname
         if candidate.is_dir():
             return str(candidate)
-    return str(repo_root / "log_ckpt")
+    return str(repo_root / "log_ckpt_new")
 
 
-def _to_plain_dict(cfg_node) -> dict:
-    return OmegaConf.to_container(cfg_node, resolve=False, throw_on_missing=False)
+def _clear_redundant_data_path_prefix(cfg) -> None:
+    data_path = cfg.dataset.data_path
+    data_path_unseen = cfg.dataset.data_path_unseen
+
+    def _is_abs_path(value) -> bool:
+        if value is None:
+            return False
+        if isinstance(value, str):
+            return os.path.isabs(value)
+        try:
+            return all(isinstance(v, str) and os.path.isabs(v) for v in value)
+        except TypeError:
+            return False
+
+    if _is_abs_path(data_path) or _is_abs_path(data_path_unseen):
+        cfg.dataset.data_path_prefix = None
 
 
-def _filter_cfg_dict(cfg_dict: dict, ignored_keys: set[str]) -> dict:
-    return {k: v for k, v in cfg_dict.items() if k not in ignored_keys}
+def _method_name(cfg: Config) -> str:
+    method_name = cfg.model.name
+    if "distance" in cfg.model:
+        method_name += f"_{cfg.model.distance}"
+    return method_name
 
 
-def _extract_seed(cfg, run_name: str) -> int | None:
-    if cfg is not None:
-        seed_value = getattr(cfg.train, "seed", None)
-        if isinstance(seed_value, int):
-            return int(seed_value)
-        if isinstance(seed_value, str) and seed_value.isdigit():
-            return int(seed_value)
-
-    match = re.search(r"(?:^|/)seed(\d+)(?:/|$)", run_name)
-    if match:
-        return int(match.group(1))
-    return None
+def _val_dir(log_dir: str) -> str:
+    return os.path.join(os.path.abspath(log_dir), "val")
 
 
-def _seed_key(seed: int | None) -> str:
-    if seed is None:
-        return "unknown"
-    return f"seed{seed}"
+def _safe_name(value: str) -> str:
+    return value.replace("/", "_").replace(" ", "_")
 
 
-def build_candidate_signature(cfg, method_name: str) -> tuple[str, dict]:
-    signature_payload = {
-        "method_name": method_name,
-        "dataset": _filter_cfg_dict(_to_plain_dict(cfg.dataset), IGNORED_DATASET_FIELDS),
-        "model": _to_plain_dict(cfg.model),
-        "train": _filter_cfg_dict(_to_plain_dict(cfg.train), IGNORED_TRAIN_FIELDS),
+def _metric_mean(value) -> float:
+    array = np.asarray(value, dtype=float)
+    if array.size == 0:
+        return np.nan
+    return float(array.mean())
+
+
+def _require_val_splits(rollouts_by_split_name: dict[str, list]) -> dict[str, list]:
+    missing = [split for split in VAL_SPLITS if split not in rollouts_by_split_name]
+    if missing:
+        raise KeyError(f"Missing required splits: {missing}")
+    return {split: rollouts_by_split_name[split] for split in VAL_SPLITS}
+
+
+def _cfg_for_split_validation(cfg: Config, split_signature: dict) -> Config:
+    saved_dataset_cfg = split_signature.get("data_payload", {}).get("dataset", {})
+    if not saved_dataset_cfg:
+        return cfg
+
+    cfg_for_validation = OmegaConf.create(OmegaConf.to_container(cfg, resolve=False))
+    for key, value in saved_dataset_cfg.items():
+        cfg_for_validation.dataset[key] = value
+    return cfg_for_validation
+
+
+
+def _load_or_rebuild_training_split(
+    cfg: Config,
+    all_rollouts: list,
+    split_path: str | None,
+) -> dict[str, list]:
+    if split_path is None:
+        raise ValueError("Saved split_seed*.json is required to guarantee an exact train/val/test split match.")
+    split_signature = load_split_signature(split_path)
+    if split_signature is not None:
+        restored_rollouts_by_split_name = restore_rollouts_by_split_signature(all_rollouts, split_signature)
+        if restored_rollouts_by_split_name is not None:
+            cfg_for_validation = _cfg_for_split_validation(cfg, split_signature)
+            validate_split_signature(cfg_for_validation, restored_rollouts_by_split_name, split_signature)
+            return restored_rollouts_by_split_name
+
+    full_rollouts_by_split_name = split_rollouts(cfg, all_rollouts)
+    if split_signature is not None:
+        cfg_for_validation = _cfg_for_split_validation(cfg, split_signature)
+        validate_split_signature(cfg_for_validation, full_rollouts_by_split_name, split_signature)
+    return full_rollouts_by_split_name
+
+
+def _build_model_scores(
+    cfg: Config,
+    rollouts_by_split_name: dict[str, list],
+    ckpt_path: str,
+) -> dict[str, list[np.ndarray]]:
+    datasets = {
+        split: RolloutDataset(cfg, rollouts)
+        for split, rollouts in rollouts_by_split_name.items()
     }
-    encoded = json.dumps(signature_payload, sort_keys=True, separators=(",", ":"))
-    return hashlib.md5(encoded.encode("utf-8")).hexdigest(), signature_payload
+    input_dim = rollouts_by_split_name["train"][0].hidden_states.shape[-1]
+    model: BaseModel = get_model(cfg, input_dim)
+    model, _ = load_model_checkpoint(model, ckpt_path)
+    model.to("cuda")
+    model.eval()
+
+    scores_by_split_name = {}
+    for split, dataset in datasets.items():
+        dataloader = DataLoader(dataset, batch_size=cfg.model.batch_size, shuffle=False, num_workers=0)
+        with torch.no_grad():
+            scores, valid_masks, _ = model_forward_dataloader(model, dataloader)
+        scores = scores.detach().cpu().numpy()
+        seq_lengths = valid_masks.sum(dim=-1).cpu().numpy()
+        scores_by_split_name[split] = [scores[i, : int(seq_lengths[i])] for i in range(len(seq_lengths))]
+    return scores_by_split_name
 
 
-def collect_new_candidates(logs_dir: str) -> list[dict]:
-    logs_dir = os.path.abspath(logs_dir)
-    candidates = []
-    for log_path in _collect_new_log_paths(logs_dir):
-        with open(log_path, "r") as f:
-            raw_logs = json.load(f)
+def _get_new_metrics_for_validation(
+    scores_by_split_name: dict[str, list[np.ndarray]],
+    rollouts_by_split_name: dict[str, list],
+    method_name: str,
+    res_dict: dict,
+) -> None:
+    _get_new_static_metrics(scores_by_split_name, rollouts_by_split_name, method_name, res_dict)
 
-        if os.path.basename(log_path) == "new_logs.json":
-            new_logs = raw_logs
-        else:
-            if "new" not in raw_logs:
-                continue
-            new_logs = raw_logs["new"]
+    cal_rollouts = list(rollouts_by_split_name["val_seen"])
+    cal_scores = [np.asarray(scores, dtype=float) for scores in scores_by_split_name["val_seen"]]
+    val_rollouts = list(rollouts_by_split_name["val_unseen"])
+    val_scores = [np.asarray(scores, dtype=float) for scores in scores_by_split_name["val_unseen"]]
 
-        run_dir = os.path.dirname(os.path.dirname(log_path))
-        run_name = os.path.relpath(run_dir, logs_dir)
-        run_meta = _get_run_meta_from_config(run_dir)
-        method_logs_by_name = _split_new_logs_by_method(new_logs, run_meta["method_name"])
+    max_length = max(len(scores) for scores in cal_scores + val_scores)
+    cal_scores = [np.pad(scores, (0, max_length - len(scores)), mode="edge") for scores in cal_scores]
+    val_scores = [np.pad(scores, (0, max_length - len(scores)), mode="edge") for scores in val_scores]
 
-        cfg = None
-        cfg_path = os.path.join(run_dir, "config.yaml")
-        if os.path.isfile(cfg_path):
-            cfg = OmegaConf.load(cfg_path)
-        seed = _extract_seed(cfg, run_name)
+    cp_bands_by_alpha = get_func_conformal_bands(cal_rollouts, cal_scores, ALPHAS)
+    _get_delay_calib_res(val_rollouts, val_scores, cp_bands_by_alpha, ALPHAS, method_name, res_dict)
 
-        for method_name, method_logs in sorted(method_logs_by_name.items()):
-            calib_summary = _summarize_new_calib(method_logs)
-            if not calib_summary:
-                continue
 
-            if cfg is not None:
-                config_signature, signature_payload = build_candidate_signature(cfg, method_name)
-                exp_suffix = getattr(cfg.train, "exp_suffix", None)
-            else:
-                config_signature = hashlib.md5(
-                    f"{method_name}:{run_name}".encode("utf-8")
-                ).hexdigest()
-                signature_payload = {"method_name": method_name, "run_name": run_name}
-                exp_suffix = None
+def _get_handcrafted_scores(
+    cfg: Config,
+    rollouts_by_split_name: dict[str, list],
+) -> dict[str, dict[str, list[np.ndarray]]]:
+    metric_keys = MANUAL_METRICS[cfg.dataset.name]
+    if metric_keys is None:
+        metric_keys = rollouts_by_split_name["train"][0].logs.columns
 
-            candidate_id = f"{method_name}::{run_name}"
-            candidates.append({
-                "candidate_id": candidate_id,
-                "method_name": method_name,
-                "run_name": run_name,
-                "run_dir": os.path.abspath(run_dir),
-                "log_path": os.path.abspath(log_path),
-                "seed": seed,
-                "exp_suffix": exp_suffix,
-                "config_signature": config_signature,
-                "signature_payload": signature_payload,
-                "new_summary": {
-                    "calib": calib_summary,
-                },
+    scores_by_metric = {}
+    for metric_key in metric_keys:
+        if metric_key not in rollouts_by_split_name["train"][0].logs.columns:
+            continue
+        metric_name = metric_key.split("/")[-1]
+        scores_by_metric[metric_name] = {
+            split: get_metrics_curve(rollouts, metric_key)
+            for split, rollouts in rollouts_by_split_name.items()
+        }
+    return scores_by_metric
+
+
+def _save_ori_outputs(save_dir: str, ori_logs: dict) -> None:
+    metrics_rows = []
+    roc_rows = []
+    pr_rows = []
+
+    static_logs_by_method = ori_logs.get("static", {})
+    for method_name, static_logs in static_logs_by_method.items():
+        for split in VAL_SPLITS:
+            task_dict = static_logs.get(split, {}).get("all", {})
+            metrics_rows.append({
+                "method": method_name,
+                "split": split,
+                "roc_auc_early": _metric_mean(task_dict.get("roc_auc", [])),
+                "prc_auc_early": _metric_mean(task_dict.get("prc_auc", [])),
             })
 
-    return candidates
+            for curve_index, (fpr, tpr) in enumerate(zip(task_dict.get("fpr", []), task_dict.get("tpr", []))):
+                for x, y in zip(np.asarray(fpr, dtype=float), np.asarray(tpr, dtype=float)):
+                    roc_rows.append({
+                        "method": method_name,
+                        "split": split,
+                        "curve_index": curve_index,
+                        "fpr": float(x),
+                        "tpr": float(y),
+                    })
+            for curve_index, (rec, pre) in enumerate(zip(task_dict.get("rec", []), task_dict.get("pre", []))):
+                for x, y in zip(np.asarray(rec, dtype=float), np.asarray(pre, dtype=float)):
+                    pr_rows.append({
+                        "method": method_name,
+                        "split": split,
+                        "curve_index": curve_index,
+                        "recall": float(x),
+                        "precision": float(y),
+                    })
+
+            safe_method = _safe_name(method_name)
+            safe_split = _safe_name(split)
+
+            roc_fig = Figure(figsize=(6, 5))
+            roc_ax = roc_fig.subplots()
+            for fpr, tpr in zip(task_dict.get("fpr", []), task_dict.get("tpr", [])):
+                roc_ax.plot(np.asarray(fpr, dtype=float), np.asarray(tpr, dtype=float), alpha=0.35, linewidth=1.5)
+            roc_ax.plot([0.0, 1.0], [0.0, 1.0], linestyle="--", linewidth=1.0, color="#666666")
+            roc_ax.set_xlabel("FPR")
+            roc_ax.set_ylabel("TPR")
+            roc_ax.set_xlim(0.0, 1.0)
+            roc_ax.set_ylim(0.0, 1.0)
+            roc_ax.set_title(f"{method_name} {split} ROC (early)")
+            roc_ax.grid(True, alpha=0.3)
+            roc_fig.tight_layout()
+            roc_fig.savefig(os.path.join(save_dir, f"ori_{safe_method}_{safe_split}_roc.png"), dpi=300)
+
+            pr_fig = Figure(figsize=(6, 5))
+            pr_ax = pr_fig.subplots()
+            for rec, pre in zip(task_dict.get("rec", []), task_dict.get("pre", [])):
+                pr_ax.plot(np.asarray(rec, dtype=float), np.asarray(pre, dtype=float), alpha=0.35, linewidth=1.5)
+            pr_ax.set_xlabel("Recall")
+            pr_ax.set_ylabel("Precision")
+            pr_ax.set_xlim(0.0, 1.0)
+            pr_ax.set_ylim(0.0, 1.0)
+            pr_ax.set_title(f"{method_name} {split} PR (early)")
+            pr_ax.grid(True, alpha=0.3)
+            pr_fig.tight_layout()
+            pr_fig.savefig(os.path.join(save_dir, f"ori_{safe_method}_{safe_split}_pr.png"), dpi=300)
+
+    pd.DataFrame(metrics_rows).to_csv(os.path.join(save_dir, "ori_metrics_early.csv"), index=False)
+    pd.DataFrame(roc_rows).to_csv(os.path.join(save_dir, "ori_roc_curve_points.csv"), index=False)
+    pd.DataFrame(pr_rows).to_csv(os.path.join(save_dir, "ori_pr_curve_points.csv"), index=False)
 
 
-def compute_common_ranges(candidates: list[dict], min_curve_fraction: float) -> dict[str, dict]:
-    range_stats_by_seed = {}
-    for seed in sorted({candidate["seed"] for candidate in candidates}, key=lambda x: (x is None, x)):
-        seed_candidates = [candidate for candidate in candidates if candidate["seed"] == seed]
-        pseudo_summary = {
-            candidate["candidate_id"]: candidate["new_summary"]
-            for candidate in seed_candidates
-        }
-        range_stats_by_seed[_seed_key(seed)] = _select_auto_common_balacc_ranges(
-            pseudo_summary,
-            min_curve_fraction=min_curve_fraction,
-        )
-    return range_stats_by_seed
-
-
-def summarize_candidate_scores(
-    candidates: list[dict],
-    range_stats: dict[str, dict],
-    penalty_det_time: float = PENALIZED_DET_TIME,
-) -> pd.DataFrame:
-    rows = []
-    for candidate in candidates:
-        calib_summary = candidate["new_summary"]["calib"]
-        seed_key = _seed_key(candidate["seed"])
-        seed_range_stats = range_stats.get(seed_key, {})
-        for mode in ("early", "last"):
-            stats = seed_range_stats.get(mode, {})
-            range_min = stats.get("bal_acc_min", np.nan)
-            range_max = stats.get("bal_acc_max", np.nan)
-            for delta, alpha_dict in sorted(calib_summary.get(mode, {}).items(), key=lambda x: float(x[0])):
-                pareto_det_times, pareto_bal_accs = _get_pareto_curve_from_alpha_dict(alpha_dict)
-                score = _compute_penalized_mean_t_at_balacc(
-                    pareto_det_times,
-                    pareto_bal_accs,
-                    range_min,
-                    range_max,
-                    penalty_det_time=penalty_det_time,
-                )
-                coverage = _compute_pareto_balacc_coverage(
-                    pareto_bal_accs,
-                    range_min,
-                    range_max,
-                )
-                max_bal_acc = _compute_max_bal_acc_from_pareto(pareto_bal_accs)
-                rows.append({
-                    "candidate_id": candidate["candidate_id"],
-                    "method": candidate["method_name"],
-                    "seed": candidate["seed"],
-                    "mode": mode,
-                    "delta": float(delta),
-                    "run_name": candidate["run_name"],
-                    "run_dir": candidate["run_dir"],
-                    "log_path": candidate["log_path"],
-                    "exp_suffix": candidate["exp_suffix"],
-                    "config_signature": candidate["config_signature"],
-                    "bal_acc_min": range_min,
-                    "bal_acc_max": range_max,
-                    "curve_fraction_target": stats.get("curve_fraction_target", np.nan),
-                    "curve_fraction_achieved": stats.get("curve_fraction_achieved", np.nan),
-                    "num_curves": stats.get("num_curves", np.nan),
-                    "pareto_points": int(len(pareto_det_times)),
-                    "pareto_coverage": coverage,
-                    "pareto_max_bal_acc": max_bal_acc,
-                    "penalty_det_time": float(penalty_det_time),
-                    "penalized_mean_t_at_balacc": score,
-                    "integral_t_at_balacc": (
-                        score * (range_max - range_min)
-                        if np.isfinite(score) and np.isfinite(range_min) and np.isfinite(range_max)
-                        else np.nan
-                    ),
-                })
-
+def _mark_pareto_rows(rows: list[dict]) -> list[dict]:
     if not rows:
-        return pd.DataFrame(
-            columns=[
-                "candidate_id",
-                "method",
-                "seed",
-                "mode",
-                "delta",
-                "run_name",
-                "run_dir",
-                "log_path",
-                "exp_suffix",
-                "config_signature",
-                "bal_acc_min",
-                "bal_acc_max",
-                "curve_fraction_target",
-                "curve_fraction_achieved",
-                "num_curves",
-                "pareto_points",
-                "pareto_coverage",
-                "pareto_max_bal_acc",
-                "penalty_det_time",
-                "penalized_mean_t_at_balacc",
-                "integral_t_at_balacc",
-            ]
-        )
+        return []
 
-    df = pd.DataFrame(rows)
-    return df.sort_values(
-        by=["method", "mode", "penalized_mean_t_at_balacc", "delta", "run_name"],
-        na_position="last",
-    ).reset_index(drop=True)
+    marked = [dict(row) for row in rows]
+    for row in marked:
+        row["is_pareto"] = False
+        row["pareto_rank"] = np.nan
+
+    best_bal_acc = -np.inf
+    pareto_rank = 0
+    order = sorted(range(len(marked)), key=lambda i: (marked[i]["avg_det_time"], -marked[i]["bal_acc"], marked[i]["alpha"]))
+    for idx in order:
+        if marked[idx]["bal_acc"] > best_bal_acc:
+            marked[idx]["is_pareto"] = True
+            marked[idx]["pareto_rank"] = pareto_rank
+            pareto_rank += 1
+            best_bal_acc = marked[idx]["bal_acc"]
+    return marked
 
 
-def select_best_candidates(score_df: pd.DataFrame) -> pd.DataFrame:
-    if score_df.empty:
-        return score_df.copy()
+def _save_new_outputs(save_dir: str, new_logs: dict) -> None:
+    raw_rows = []
+    for method_name, calib_logs in new_logs.get("calib", {}).items():
+        for mode, delta_dict in calib_logs.items():
+            for delta, alpha_dict in delta_dict.items():
+                rows = []
+                for alpha, metrics in alpha_dict.items():
+                    row = {
+                        "method": method_name,
+                        "mode": mode,
+                        "delta": float(delta),
+                        "alpha": float(alpha),
+                        "avg_det_time": _metric_mean(metrics.get("avg_det_time", [])),
+                        "bal_acc": _metric_mean(metrics.get("bal_acc", [])),
+                        "acc": _metric_mean(metrics.get("acc", [])),
+                        "f1": _metric_mean(metrics.get("f1", [])),
+                        "fpr": _metric_mean(metrics.get("fpr", [])),
+                        "fnr": _metric_mean(metrics.get("fnr", [])),
+                        "tpr": _metric_mean(metrics.get("tpr", [])),
+                        "tnr": _metric_mean(metrics.get("tnr", [])),
+                    }
+                    if "ttd_auc" in metrics:
+                        row["ttd_auc"] = _metric_mean(metrics.get("ttd_auc", []))
+                    rows.append(row)
+                raw_rows.extend(_mark_pareto_rows(rows))
 
-    sortable = score_df.copy()
-    sortable["score_for_sort"] = sortable["penalized_mean_t_at_balacc"].fillna(np.inf)
-    sortable["coverage_for_sort"] = sortable["pareto_coverage"].fillna(-np.inf)
-    sortable["max_bal_acc_for_sort"] = sortable["pareto_max_bal_acc"].fillna(-np.inf)
-    sortable = sortable.sort_values(
-        by=[
-            "method",
-            "seed",
-            "mode",
-            "score_for_sort",
-            "coverage_for_sort",
-            "max_bal_acc_for_sort",
-            "delta",
-            "run_name",
-        ],
-        ascending=[True, True, True, True, False, False, True, True],
-        na_position="last",
-    )
-    selected = sortable.groupby(["method", "seed", "mode"], as_index=False).head(1).copy()
-    selected = selected.drop(
-        columns=["score_for_sort", "coverage_for_sort", "max_bal_acc_for_sort"]
-    )
-    return selected.reset_index(drop=True)
-
-
-def summarize_selected_candidates(selection_df: pd.DataFrame) -> pd.DataFrame:
-    if selection_df.empty:
-        return pd.DataFrame(
-            columns=[
-                "method",
-                "mode",
-                "num_seeds",
-                "mean_penalized_mean_t_at_balacc",
-                "std_penalized_mean_t_at_balacc",
-                "mean_integral_t_at_balacc",
-                "std_integral_t_at_balacc",
-            ]
-        )
-
-    rows = []
-    for (method, mode), group in selection_df.groupby(["method", "mode"], dropna=False):
-        rows.append({
-            "method": method,
-            "mode": mode,
-            "num_seeds": int(len(group)),
-            "mean_penalized_mean_t_at_balacc": float(group["penalized_mean_t_at_balacc"].mean()),
-            "std_penalized_mean_t_at_balacc": float(group["penalized_mean_t_at_balacc"].std(ddof=0)),
-            "mean_integral_t_at_balacc": float(group["integral_t_at_balacc"].mean()),
-            "std_integral_t_at_balacc": float(group["integral_t_at_balacc"].std(ddof=0)),
-        })
-    return pd.DataFrame(rows).sort_values(by=["mode", "mean_penalized_mean_t_at_balacc", "method"]).reset_index(drop=True)
+    raw_df = pd.DataFrame(raw_rows)
+    raw_df.to_csv(os.path.join(save_dir, "new_t_at_balacc_raw.csv"), index=False)
+    raw_df[raw_df["is_pareto"]].to_csv(os.path.join(save_dir, "new_t_at_balacc_pareto.csv"), index=False)
 
 
-def range_stats_to_df(range_stats: dict[str, dict]) -> pd.DataFrame:
-    rows = []
-    for seed_key, seed_stats in range_stats.items():
-        for mode in ("early", "last"):
-            if mode not in seed_stats:
-                continue
-            row = dict(seed_stats[mode])
-            row["seed_key"] = seed_key
-            rows.append(row)
-    if not rows:
-        return pd.DataFrame(
-            columns=[
-                "seed_key",
-                "mode",
-                "curve_fraction_target",
-                "curve_fraction_achieved",
-                "num_curves",
-                "bal_acc_min",
-                "bal_acc_max",
-                "bal_acc_width",
-            ]
-        )
-    return pd.DataFrame(rows).sort_values(by=["seed_key", "mode"]).reset_index(drop=True)
+def evaluate_run(log_dir: str, logs_dir: str) -> dict:
+    cfg = OmegaConf.load(os.path.join(log_dir, "config.yaml"))
+    _clear_redundant_data_path_prefix(cfg)
+    cfg.train.eval_ckpt_path = log_dir
+    cfg = process_cfg(cfg)
 
+    seed_everything(0)
+    with Timer("Loading rollouts"):
+        all_rollouts = load_rollouts(cfg)
+        print(f"Loaded {len(all_rollouts)} rollouts")
+        if cfg.dataset.load_to_cuda:
+            all_rollouts = [rollout.to("cuda") for rollout in all_rollouts]
 
-def _selection_to_json_records(selection_df: pd.DataFrame) -> list[dict]:
-    records = []
-    for row in selection_df.to_dict(orient="records"):
-        records.append({
-            key: (
-                value.item()
-                if isinstance(value, np.generic)
-                else value
+    if len(all_rollouts) == 0:
+        raise ValueError(f"No rollouts loaded from {cfg.dataset.data_path}")
+
+    if cfg.dataset.normalize_hidden_states:
+        all_rollouts = normalize_rollouts_hidden_states(all_rollouts)
+
+    ori_logs = {}
+    new_logs = {}
+    method_name = _method_name(cfg)
+    is_handcrafted = bool(cfg.train.log_precomputed or cfg.train.log_precomputed_only)
+
+    for seed in parse_seeds(cfg.train.seed):
+        cfg.train.seed = seed
+        seed_everything(seed)
+
+        ckpt_path = None if cfg.train.log_precomputed_only else resolve_ckpt_path(cfg.train.eval_ckpt_path, seed)
+        split_path = resolve_split_path(cfg.train.eval_split_path, ckpt_path, seed)
+        if split_path is None:
+            expected_split_path = None
+            if ckpt_path is not None:
+                ckpt_dir = ckpt_path if os.path.isdir(ckpt_path) else os.path.dirname(ckpt_path)
+                expected_split_path = os.path.join(ckpt_dir, f"split_seed{seed}.json")
+            raise ValueError(
+                "Saved split_seed*.json is required to guarantee an exact train/val/test split match. "
+                f"run_dir={os.path.abspath(log_dir)} seed={seed} expected_split_path={expected_split_path}"
             )
-            for key, value in row.items()
-        })
-    return records
+        full_rollouts_by_split_name = _load_or_rebuild_training_split(cfg, all_rollouts, split_path)
+        rollouts_by_split_name = _require_val_splits(full_rollouts_by_split_name)
+
+        if is_handcrafted:
+            for metric_name, scores_by_split_name in _get_handcrafted_scores(cfg, rollouts_by_split_name).items():
+                get_ori_metrics(scores_by_split_name, rollouts_by_split_name, metric_name, ori_logs)
+                _get_new_metrics_for_validation(scores_by_split_name, rollouts_by_split_name, metric_name, new_logs)
+        else:
+            if ckpt_path is None:
+                raise ValueError("Missing checkpoint path for model validation")
+            scores_by_split_name = _build_model_scores(cfg, rollouts_by_split_name, ckpt_path)
+            get_ori_metrics(scores_by_split_name, rollouts_by_split_name, method_name, ori_logs)
+            _get_new_metrics_for_validation(scores_by_split_name, rollouts_by_split_name, method_name, new_logs)
+
+    save_dir = _val_dir(log_dir)
+    os.makedirs(save_dir, exist_ok=True)
+    with open(os.path.join(save_dir, "ori_logs.json"), "w") as f:
+        json.dump(to_jsonable(ori_logs), f, indent=2)
+    with open(os.path.join(save_dir, "new_logs.json"), "w") as f:
+        json.dump(to_jsonable(new_logs), f, indent=2)
+
+    _save_ori_outputs(save_dir, ori_logs)
+    _save_new_outputs(save_dir, new_logs)
+
+    return {
+        "run_name": os.path.relpath(log_dir, os.path.abspath(logs_dir)),
+        "run_dir": os.path.abspath(log_dir),
+        "method": method_name,
+        "val_dir": save_dir,
+        "ori_log_path": os.path.join(save_dir, "ori_logs.json"),
+        "new_log_path": os.path.join(save_dir, "new_logs.json"),
+        "ori_metrics_path": os.path.join(save_dir, "ori_metrics_early.csv"),
+        "new_raw_path": os.path.join(save_dir, "new_t_at_balacc_raw.csv"),
+        "new_pareto_path": os.path.join(save_dir, "new_t_at_balacc_pareto.csv"),
+    }
 
 
-def run_validation_pipeline(
-    logs_dir: str,
-    save_dir: str,
-    min_curve_fraction: float,
-    penalty_det_time: float,
-) -> dict:
+def run_batch_validation(logs_dir: str, save_dir: str) -> dict:
+    logs_dir = os.path.abspath(logs_dir)
+    save_dir = os.path.abspath(save_dir)
     os.makedirs(save_dir, exist_ok=True)
 
-    candidates = collect_new_candidates(logs_dir)
-    range_stats = compute_common_ranges(candidates, min_curve_fraction=min_curve_fraction)
-    score_df = summarize_candidate_scores(
-        candidates,
-        range_stats,
-        penalty_det_time=penalty_det_time,
-    )
-    selection_df = select_best_candidates(score_df)
-    selection_summary_df = summarize_selected_candidates(selection_df)
-    range_df = range_stats_to_df(range_stats)
+    rows = []
+    failures = []
+    for log_dir in collect_eval_dirs(Path(logs_dir)):
+        try:
+            rows.append(evaluate_run(str(log_dir), logs_dir))
+        except Exception as exc:
+            failure = {
+                "run_name": os.path.relpath(str(log_dir), logs_dir),
+                "run_dir": os.path.abspath(str(log_dir)),
+                "error_type": type(exc).__name__,
+                "error": str(exc),
+                "traceback": traceback.format_exc(),
+            }
+            failures.append(failure)
+            print(f"[val_new] Failed evaluating {failure['run_dir']}: {failure['error']}")
 
-    score_df.to_csv(os.path.join(save_dir, "val_all_candidates.csv"), index=False)
-    selection_df.to_csv(os.path.join(save_dir, "val_best_by_method_seed.csv"), index=False)
-    selection_summary_df.to_csv(os.path.join(save_dir, "val_best_aggregate.csv"), index=False)
-    range_df.to_csv(os.path.join(save_dir, "val_common_balacc_range.csv"), index=False)
+    pd.DataFrame(rows).to_csv(os.path.join(save_dir, "val_summary.csv"), index=False)
+    if failures:
+        pd.DataFrame([{k: v for k, v in failure.items() if k != "traceback"} for failure in failures]).to_csv(
+            os.path.join(save_dir, "val_failures.csv"), index=False
+        )
+        with open(os.path.join(save_dir, "val_failures.json"), "w") as f:
+            json.dump(failures, f, indent=2)
 
     payload = {
-        "logs_dir": os.path.abspath(logs_dir),
-        "save_dir": os.path.abspath(save_dir),
-        "penalty_det_time": float(penalty_det_time),
-        "range_stats": range_stats,
-        "selected": _selection_to_json_records(selection_df),
+        "logs_dir": logs_dir,
+        "save_dir": save_dir,
+        "num_runs": len(rows),
+        "num_failures": len(failures),
     }
-    with open(os.path.join(save_dir, "val_selection.json"), "w") as f:
+    with open(os.path.join(save_dir, "val_summary.json"), "w") as f:
         json.dump(payload, f, indent=2)
-
     return payload
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Select the best hyper-parameter setting for each method using Pareto T@BalAcc on validation logs.",
+        description="Run train/validation-only metrics for trained checkpoints and save ori/new validation logs.",
     )
     parser.add_argument(
         "--logs-dir",
         default=_resolve_default_logs_dir(),
-        help="Root directory that contains run folders with eval/new_logs.json.",
+        help="Root directory containing trained run folders with config.yaml and checkpoints.",
     )
     parser.add_argument(
         "--save-dir",
         default=None,
-        help="Directory to save validation summaries. Defaults to <logs-dir>/pipeline_val_new.",
-    )
-    parser.add_argument(
-        "--min-curve-fraction",
-        type=float,
-        default=0.8,
-        help="Minimum fraction of Pareto curves that must cover the chosen common BalAcc interval.",
-    )
-    parser.add_argument(
-        "--penalty-det-time",
-        type=float,
-        default=PENALIZED_DET_TIME,
-        help="Penalty detection time used when a Pareto curve cannot reach a target BalAcc.",
+        help="Directory to save batch validation summaries. Defaults to <logs-dir>/pipeline_val_new.",
     )
     args = parser.parse_args()
 
     save_dir = args.save_dir or os.path.join(os.path.abspath(args.logs_dir), "pipeline_val_new")
-    result = run_validation_pipeline(
-        logs_dir=args.logs_dir,
-        save_dir=save_dir,
-        min_curve_fraction=args.min_curve_fraction,
-        penalty_det_time=args.penalty_det_time,
-    )
-
-    print("Saved validation selection to", os.path.abspath(os.path.join(save_dir, "val_selection.json")))
-    for record in result["selected"]:
-        print(
-            f"[{record['mode']}] {record['method']}: "
-            f"run={record['run_name']} delta={record['delta']:.3f} "
-            f"score={record['penalized_mean_t_at_balacc']:.6f}"
-        )
+    result = run_batch_validation(args.logs_dir, save_dir)
+    print("Saved validation summary to", os.path.abspath(os.path.join(save_dir, "val_summary.json")))
+    print(f"runs={result['num_runs']}")
 
 
 if __name__ == "__main__":

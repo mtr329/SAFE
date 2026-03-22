@@ -22,7 +22,11 @@ from failure_prob.utils.routines import (
     eval_model_and_log,
     eval_save_timing_plots,
 )
-from failure_prob.utils.split_io import load_split_signature, validate_split_signature
+from failure_prob.utils.split_io import (
+    load_split_signature,
+    restore_rollouts_by_split_signature,
+    validate_split_signature,
+)
 from failure_prob.utils.timer import Timer
 from failure_prob.utils.video import eval_save_videos, eval_save_videos_functional_cp
 from failure_prob.utils.routines import (
@@ -186,7 +190,6 @@ def run_batch_eval(target_root: Path) -> None:
         print("Running:", log_dir)
         cfg = OmegaConf.load(log_dir / "config.yaml")
         cfg.train.eval_ckpt_path = str(log_dir)
-        cfg.dataset.data_path_prefix = ""
         evaluate_cfg(cfg)
 
 
@@ -203,7 +206,61 @@ def resolve_default_debug_run_dir(repo_root: Path) -> Path:
     return repo_root / "log_ckpt"
 
 
+def _clear_redundant_data_path_prefix(cfg) -> None:
+    data_path = cfg.dataset.data_path
+    data_path_unseen = cfg.dataset.data_path_unseen
+
+    def _is_abs_path(value) -> bool:
+        if value is None:
+            return False
+        if isinstance(value, str):
+            return os.path.isabs(value)
+        try:
+            return all(isinstance(v, str) and os.path.isabs(v) for v in value)
+        except TypeError:
+            return False
+
+    if _is_abs_path(data_path) or _is_abs_path(data_path_unseen):
+        cfg.dataset.data_path_prefix = None
+
+
+
+def _cfg_for_split_validation(cfg: Config, split_signature: dict) -> Config:
+    saved_dataset_cfg = split_signature.get("data_payload", {}).get("dataset", {})
+    if not saved_dataset_cfg:
+        return cfg
+
+    cfg_for_validation = OmegaConf.create(OmegaConf.to_container(cfg, resolve=False))
+    for key, value in saved_dataset_cfg.items():
+        cfg_for_validation.dataset[key] = value
+    return cfg_for_validation
+
+
+
+def _load_or_rebuild_training_split(
+    cfg: Config,
+    all_rollouts: list,
+    split_path: str | None,
+) -> tuple[dict[str, list], dict | None]:
+    if split_path is None:
+        raise ValueError("Saved split_seed*.json is required to guarantee an exact train/val/test split match.")
+    split_signature = load_split_signature(split_path)
+    if split_signature is not None:
+        restored_rollouts_by_split_name = restore_rollouts_by_split_signature(all_rollouts, split_signature)
+        if restored_rollouts_by_split_name is not None:
+            cfg_for_validation = _cfg_for_split_validation(cfg, split_signature)
+            validate_split_signature(cfg_for_validation, restored_rollouts_by_split_name, split_signature)
+            return restored_rollouts_by_split_name, split_signature
+
+    rollouts_by_split_name = split_rollouts(cfg, all_rollouts)
+    if split_signature is not None:
+        cfg_for_validation = _cfg_for_split_validation(cfg, split_signature)
+        validate_split_signature(cfg_for_validation, rollouts_by_split_name, split_signature)
+    return rollouts_by_split_name, split_signature
+
+
 def evaluate_cfg(cfg: Config) -> None:
+    _clear_redundant_data_path_prefix(cfg)
     cfg = process_cfg(cfg)
     print(OmegaConf.to_yaml(cfg))
 
@@ -253,19 +310,14 @@ def evaluate_cfg(cfg: Config) -> None:
             ckpt_path = resolve_ckpt_path(cfg.train.eval_ckpt_path, seed)
 
         split_path = resolve_split_path(cfg.train.eval_split_path, ckpt_path, seed)
-        rollouts_by_split_name = split_rollouts(cfg, all_rollouts)
+        if split_path is not None:
+            print("Loading split signature from", os.path.abspath(split_path))
+        rollouts_by_split_name, split_signature = _load_or_rebuild_training_split(cfg, all_rollouts, split_path)
         task_min_steps_by_split = collect_task_min_steps(rollouts_by_split_name)
         task_min_step_logs[str(seed)] = task_min_steps_by_split
         print_task_min_steps(task_min_steps_by_split)
-        if split_path is not None:
-            print("Loading split signature from", os.path.abspath(split_path))
-            split_signature = load_split_signature(split_path)
-            split_md5 = validate_split_signature(
-                cfg,
-                rollouts_by_split_name,
-                split_signature,
-            )
-            print(f"Validated split md5: {split_md5}")
+        if split_signature is not None:
+            print(f"Validated split md5: {split_signature['signature_md5']}")
 
         dataset_by_split_name = {
             split: RolloutDataset(cfg, rollouts)
