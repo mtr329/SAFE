@@ -35,8 +35,10 @@ from failure_prob.pipeline.val_new import (
 from failure_prob.utils.split_io import _dataset_hash_payload, load_split_signature
 
 VAL_SPLIT = VAL_SPLITS[-1]
-PARETO_INTEGRAL_BAL_ACC_MIN = 0.7
-PARETO_INTEGRAL_BAL_ACC_MAX = 1.0
+PARETO_INTEGRAL_EARLY_BAL_ACC_MIN = 0.6
+PARETO_INTEGRAL_EARLY_BAL_ACC_MAX = 0.8
+PARETO_INTEGRAL_LAST_BAL_ACC_MIN = 0.7
+PARETO_INTEGRAL_LAST_BAL_ACC_MAX = 0.9
 
 
 def _extract_seed(cfg, run_name: str) -> int | None:
@@ -241,6 +243,20 @@ def summarize_val_roc_auc(candidates: list[dict]) -> tuple[pd.DataFrame, pd.Data
     return score_df, selected_df
 
 
+def _range_for_mode(
+    mode: str,
+    early_bal_acc_min: float,
+    early_bal_acc_max: float,
+    last_bal_acc_min: float,
+    last_bal_acc_max: float,
+) -> tuple[float, float]:
+    if str(mode) == "early":
+        return float(early_bal_acc_min), float(early_bal_acc_max)
+    if str(mode) == "last":
+        return float(last_bal_acc_min), float(last_bal_acc_max)
+    raise ValueError(f"Unsupported pareto mode: {mode}")
+
+
 def _build_fixed_balacc_range(
     intervals: list[dict],
     method: str,
@@ -268,8 +284,10 @@ def _build_fixed_balacc_range(
 
 def build_val_pareto_ranges(
     candidates: list[dict],
-    bal_acc_min: float,
-    bal_acc_max: float,
+    early_bal_acc_min: float,
+    early_bal_acc_max: float,
+    last_bal_acc_min: float,
+    last_bal_acc_max: float,
 ) -> tuple[dict[tuple[str, str], dict], pd.DataFrame]:
     intervals_by_group: dict[tuple[str, str], list[dict]] = {}
     for candidate in candidates:
@@ -294,12 +312,19 @@ def build_val_pareto_ranges(
     })
     range_by_group = {}
     for method, mode in all_group_keys:
+        group_bal_acc_min, group_bal_acc_max = _range_for_mode(
+            mode,
+            early_bal_acc_min,
+            early_bal_acc_max,
+            last_bal_acc_min,
+            last_bal_acc_max,
+        )
         stats = _build_fixed_balacc_range(
             intervals_by_group.get((method, mode), []),
             method=method,
             mode=mode,
-            bal_acc_min=bal_acc_min,
-            bal_acc_max=bal_acc_max,
+            bal_acc_min=group_bal_acc_min,
+            bal_acc_max=group_bal_acc_max,
         )
         range_by_group[(method, mode)] = stats
         rows.append(stats)
@@ -1235,8 +1260,10 @@ def run_test_pipeline(
     logs_dir: str,
     save_dir: str,
     force_eval: bool = False,
-    bal_acc_min: float = PARETO_INTEGRAL_BAL_ACC_MIN,
-    bal_acc_max: float = PARETO_INTEGRAL_BAL_ACC_MAX,
+    early_bal_acc_min: float = PARETO_INTEGRAL_EARLY_BAL_ACC_MIN,
+    early_bal_acc_max: float = PARETO_INTEGRAL_EARLY_BAL_ACC_MAX,
+    last_bal_acc_min: float = PARETO_INTEGRAL_LAST_BAL_ACC_MIN,
+    last_bal_acc_max: float = PARETO_INTEGRAL_LAST_BAL_ACC_MAX,
     penalty_det_time: float = PENALIZED_DET_TIME,
 ) -> dict:
     logs_dir = os.path.abspath(logs_dir)
@@ -1256,8 +1283,10 @@ def run_test_pipeline(
 
     range_by_group, range_df = build_val_pareto_ranges(
         candidates,
-        bal_acc_min=bal_acc_min,
-        bal_acc_max=bal_acc_max,
+        early_bal_acc_min=early_bal_acc_min,
+        early_bal_acc_max=early_bal_acc_max,
+        last_bal_acc_min=last_bal_acc_min,
+        last_bal_acc_max=last_bal_acc_max,
     )
     val_pareto_df = score_pareto_candidates(
         candidates,
@@ -1424,8 +1453,10 @@ def run_test_pipeline(
         "logs_dir": logs_dir,
         "save_dir": save_dir,
         "force_eval": bool(force_eval),
-        "integral_bal_acc_min": float(bal_acc_min),
-        "integral_bal_acc_max": float(bal_acc_max),
+        "integral_early_bal_acc_min": float(early_bal_acc_min),
+        "integral_early_bal_acc_max": float(early_bal_acc_max),
+        "integral_last_bal_acc_min": float(last_bal_acc_min),
+        "integral_last_bal_acc_max": float(last_bal_acc_max),
         "penalty_det_time": float(penalty_det_time),
         "num_candidates": int(len(candidates)),
         "num_selected_runs": int(len(selected_pairs)),
@@ -1467,16 +1498,28 @@ def main() -> None:
         help="Re-run test evaluation even if eval/ori_logs.json and eval/new_logs.json already exist.",
     )
     parser.add_argument(
-        "--pareto-bal-acc-min",
+        "--pareto-early-bal-acc-min",
         type=float,
-        default=PARETO_INTEGRAL_BAL_ACC_MIN,
-        help="Lower bound of the fixed bal_acc range used for Pareto integration.",
+        default=PARETO_INTEGRAL_EARLY_BAL_ACC_MIN,
+        help="Lower bound of the fixed early bal_acc range used for Pareto integration.",
     )
     parser.add_argument(
-        "--pareto-bal-acc-max",
+        "--pareto-early-bal-acc-max",
         type=float,
-        default=PARETO_INTEGRAL_BAL_ACC_MAX,
-        help="Upper bound of the fixed bal_acc range used for Pareto integration.",
+        default=PARETO_INTEGRAL_EARLY_BAL_ACC_MAX,
+        help="Upper bound of the fixed early bal_acc range used for Pareto integration.",
+    )
+    parser.add_argument(
+        "--pareto-last-bal-acc-min",
+        type=float,
+        default=PARETO_INTEGRAL_LAST_BAL_ACC_MIN,
+        help="Lower bound of the fixed last bal_acc range used for Pareto integration.",
+    )
+    parser.add_argument(
+        "--pareto-last-bal-acc-max",
+        type=float,
+        default=PARETO_INTEGRAL_LAST_BAL_ACC_MAX,
+        help="Upper bound of the fixed last bal_acc range used for Pareto integration.",
     )
     parser.add_argument(
         "--penalty-det-time",
@@ -1491,8 +1534,10 @@ def main() -> None:
         logs_dir=args.logs_dir,
         save_dir=save_dir,
         force_eval=args.force_eval,
-        bal_acc_min=args.pareto_bal_acc_min,
-        bal_acc_max=args.pareto_bal_acc_max,
+        early_bal_acc_min=args.pareto_early_bal_acc_min,
+        early_bal_acc_max=args.pareto_early_bal_acc_max,
+        last_bal_acc_min=args.pareto_last_bal_acc_min,
+        last_bal_acc_max=args.pareto_last_bal_acc_max,
         penalty_det_time=args.penalty_det_time,
     )
 

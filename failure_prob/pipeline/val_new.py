@@ -56,8 +56,10 @@ VAL_SPLITS = ("train", "val_seen", "val_unseen")
 ALPHAS = [0.02, 0.05, 0.1, 0.15, 0.2, 0.25, 0.3, 0.35, 0.4, 0.45, 0.5, 0.6, 0.7, 0.8, 0.9]
 
 VAL_SPLIT = VAL_SPLITS[-1]
-PARETO_INTEGRAL_BAL_ACC_MIN = 0.7
-PARETO_INTEGRAL_BAL_ACC_MAX = 1.0
+PARETO_INTEGRAL_EARLY_BAL_ACC_MIN = 0.6
+PARETO_INTEGRAL_EARLY_BAL_ACC_MAX = 0.8
+PARETO_INTEGRAL_LAST_BAL_ACC_MIN = 0.7
+PARETO_INTEGRAL_LAST_BAL_ACC_MAX = 0.9
 
 
 def _resolve_default_logs_dir() -> str:
@@ -493,6 +495,20 @@ def summarize_mean_val_ori_metric(
     return by_seed_df, by_weight_df, best_df
 
 
+def _range_for_mode(
+    mode: str,
+    early_bal_acc_min: float,
+    early_bal_acc_max: float,
+    last_bal_acc_min: float,
+    last_bal_acc_max: float,
+) -> tuple[float, float]:
+    if str(mode) == "early":
+        return float(early_bal_acc_min), float(early_bal_acc_max)
+    if str(mode) == "last":
+        return float(last_bal_acc_min), float(last_bal_acc_max)
+    raise ValueError(f"Unsupported pareto mode: {mode}")
+
+
 def _build_fixed_balacc_range(
     intervals: list[dict],
     method: str,
@@ -520,8 +536,10 @@ def _build_fixed_balacc_range(
 
 def build_val_pareto_ranges(
     candidates: list[dict],
-    bal_acc_min: float,
-    bal_acc_max: float,
+    early_bal_acc_min: float,
+    early_bal_acc_max: float,
+    last_bal_acc_min: float,
+    last_bal_acc_max: float,
 ) -> tuple[dict[tuple[str, str], dict], pd.DataFrame]:
     intervals_by_group: dict[tuple[str, str], list[dict]] = {}
     for candidate in candidates:
@@ -545,12 +563,19 @@ def build_val_pareto_ranges(
     })
     range_by_group = {}
     for method, mode in all_group_keys:
+        group_bal_acc_min, group_bal_acc_max = _range_for_mode(
+            mode,
+            early_bal_acc_min,
+            early_bal_acc_max,
+            last_bal_acc_min,
+            last_bal_acc_max,
+        )
         stats = _build_fixed_balacc_range(
             intervals_by_group.get((method, mode), []),
             method=method,
             mode=mode,
-            bal_acc_min=bal_acc_min,
-            bal_acc_max=bal_acc_max,
+            bal_acc_min=group_bal_acc_min,
+            bal_acc_max=group_bal_acc_max,
         )
         range_by_group[(method, mode)] = stats
         rows.append(stats)
@@ -631,14 +656,18 @@ def score_val_pareto_candidates(
 
 def summarize_mean_val_pareto(
     candidates: list[dict],
-    bal_acc_min: float = PARETO_INTEGRAL_BAL_ACC_MIN,
-    bal_acc_max: float = PARETO_INTEGRAL_BAL_ACC_MAX,
+    early_bal_acc_min: float = PARETO_INTEGRAL_EARLY_BAL_ACC_MIN,
+    early_bal_acc_max: float = PARETO_INTEGRAL_EARLY_BAL_ACC_MAX,
+    last_bal_acc_min: float = PARETO_INTEGRAL_LAST_BAL_ACC_MIN,
+    last_bal_acc_max: float = PARETO_INTEGRAL_LAST_BAL_ACC_MAX,
     penalty_det_time: float = PENALIZED_DET_TIME,
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     range_by_group, range_df = build_val_pareto_ranges(
         candidates,
-        bal_acc_min=bal_acc_min,
-        bal_acc_max=bal_acc_max,
+        early_bal_acc_min=early_bal_acc_min,
+        early_bal_acc_max=early_bal_acc_max,
+        last_bal_acc_min=last_bal_acc_min,
+        last_bal_acc_max=last_bal_acc_max,
     )
     by_seed_df = score_val_pareto_candidates(candidates, range_by_group=range_by_group, penalty_det_time=penalty_det_time)
     agg_cols = [
@@ -695,8 +724,10 @@ def summarize_mean_val_pareto(
 def write_val_selection_summaries(
     rows: list[dict],
     save_dir: str,
-    bal_acc_min: float = PARETO_INTEGRAL_BAL_ACC_MIN,
-    bal_acc_max: float = PARETO_INTEGRAL_BAL_ACC_MAX,
+    early_bal_acc_min: float = PARETO_INTEGRAL_EARLY_BAL_ACC_MIN,
+    early_bal_acc_max: float = PARETO_INTEGRAL_EARLY_BAL_ACC_MAX,
+    last_bal_acc_min: float = PARETO_INTEGRAL_LAST_BAL_ACC_MIN,
+    last_bal_acc_max: float = PARETO_INTEGRAL_LAST_BAL_ACC_MAX,
     penalty_det_time: float = PENALIZED_DET_TIME,
 ) -> dict:
     candidates = collect_val_candidates_from_rows(rows)
@@ -707,8 +738,10 @@ def write_val_selection_summaries(
     prc_seed_df, prc_weight_df, prc_best_df = summarize_mean_val_ori_metric(candidates, primary_metric="prc")
     range_df, pareto_seed_df, pareto_weight_df, pareto_best_df = summarize_mean_val_pareto(
         candidates,
-        bal_acc_min=bal_acc_min,
-        bal_acc_max=bal_acc_max,
+        early_bal_acc_min=early_bal_acc_min,
+        early_bal_acc_max=early_bal_acc_max,
+        last_bal_acc_min=last_bal_acc_min,
+        last_bal_acc_max=last_bal_acc_max,
         penalty_det_time=penalty_det_time,
     )
 
@@ -742,8 +775,10 @@ def write_val_selection_summaries(
     _write_dataframe(pareto_best_df, os.path.join(pareto_dir, "best_weights.csv"))
     _save_payload(os.path.join(pareto_dir, "summary.json"), {
         "strategy": "pareto_integral_t_at_balacc",
-        "integral_bal_acc_min": float(bal_acc_min),
-        "integral_bal_acc_max": float(bal_acc_max),
+        "integral_early_bal_acc_min": float(early_bal_acc_min),
+        "integral_early_bal_acc_max": float(early_bal_acc_max),
+        "integral_last_bal_acc_min": float(last_bal_acc_min),
+        "integral_last_bal_acc_max": float(last_bal_acc_max),
         "num_candidates": int(len(pareto_seed_df)),
         "num_weight_groups": int(len(pareto_weight_df)),
         "bal_acc_ranges": _to_jsonable_records(range_df),
