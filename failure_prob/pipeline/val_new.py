@@ -29,8 +29,19 @@ from failure_prob.eval import (
 )
 from failure_prob.model import get_model
 from failure_prob.model.base import BaseModel
+from failure_prob.mrefine.delay_summary import (
+    AUTO_COMMON_BAL_ACC_GRID_STEP,
+    AUTO_COMMON_BAL_ACC_MIN_CURVE_FRACTION,
+    PENALIZED_DET_TIME,
+    _compute_max_bal_acc_from_pareto,
+    _compute_pareto_balacc_coverage,
+    _compute_penalized_mean_t_at_balacc,
+    _get_pareto_curve_from_alpha_dict,
+)
 from failure_prob.mrefine.new_eval import _get_delay_calib_res, _get_new_static_metrics
+from failure_prob.mrefine.new_summary import _split_new_logs_by_method
 from failure_prob.mrefine.ori_eval import get_ori_metrics
+from failure_prob.mrefine.ori_summary import _split_ori_logs_by_method
 from failure_prob.mrefine.utils import get_func_conformal_bands
 from failure_prob.utils.constants import MANUAL_METRICS
 from failure_prob.utils.metrics import get_metrics_curve
@@ -45,6 +56,8 @@ from failure_prob.utils.timer import Timer
 
 VAL_SPLITS = ("train", "val_seen", "val_unseen")
 ALPHAS = [0.02, 0.05, 0.1, 0.15, 0.2, 0.25, 0.3, 0.35, 0.4, 0.45, 0.5, 0.6, 0.7, 0.8, 0.9]
+
+VAL_SPLIT = VAL_SPLITS[-1]
 
 
 def _resolve_default_logs_dir() -> str:
@@ -326,6 +339,462 @@ def _save_new_outputs(save_dir: str, new_logs: dict) -> None:
     raw_df[raw_df["is_pareto"]].to_csv(os.path.join(save_dir, "new_t_at_balacc_pareto.csv"), index=False)
 
 
+def _extract_seed_from_run_name(run_name: str) -> int | None:
+    for part in Path(run_name).parts:
+        if part.startswith("seed") and part[4:].isdigit():
+            return int(part[4:])
+    return None
+
+
+def _weight_key_from_run_name(run_name: str) -> str:
+    parts = list(Path(run_name).parts)
+    if parts and parts[0].startswith("seed") and parts[0][4:].isdigit():
+        parts = parts[1:]
+    return str(Path(*parts)) if parts else run_name
+
+
+def _to_jsonable_records(df: pd.DataFrame) -> list[dict]:
+    records = []
+    for row in df.to_dict(orient="records"):
+        records.append({
+            key: (value.item() if isinstance(value, np.generic) else value)
+            for key, value in row.items()
+        })
+    return records
+
+
+def _write_dataframe(df: pd.DataFrame, path: str) -> None:
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    df.to_csv(path, index=False)
+
+
+def _save_payload(path: str, payload: dict) -> None:
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w") as f:
+        json.dump(payload, f, indent=2)
+
+
+def _summarize_ori_metric(ori_logs: dict, split_name: str) -> tuple[float, float]:
+    task_dict = ori_logs.get("static", {}).get(split_name, {}).get("all", {})
+    return _metric_mean(task_dict.get("roc_auc", [])), _metric_mean(task_dict.get("prc_auc", []))
+
+
+def _mean_alpha_dict(alpha_dict: dict) -> dict:
+    mean_alpha_dict = {}
+    for alpha, metrics in alpha_dict.items():
+        mean_alpha_dict[alpha] = {
+            key: (value if key == "detect_method" else _metric_mean(value))
+            for key, value in metrics.items()
+        }
+    return mean_alpha_dict
+
+
+def _seed_runs_json(group: pd.DataFrame) -> str:
+    mapping = {}
+    for row in group.sort_values(by=["seed", "run_name"]).itertuples(index=False):
+        if pd.isna(row.seed):
+            key = "seed?"
+        else:
+            key = f"seed{int(row.seed)}"
+        mapping[key] = row.run_name
+    return json.dumps(mapping, sort_keys=True)
+
+
+def collect_val_candidates_from_rows(rows: list[dict]) -> list[dict]:
+    candidates = []
+    for row in rows:
+        ori_path = row.get("ori_log_path")
+        new_path = row.get("new_log_path")
+        if not ori_path or not new_path or not os.path.isfile(ori_path) or not os.path.isfile(new_path):
+            continue
+
+        with open(ori_path, "r") as f:
+            ori_logs = json.load(f)
+        with open(new_path, "r") as f:
+            new_logs = json.load(f)
+
+        method_name = str(row["method"])
+        run_name = str(row["run_name"])
+        candidates.append({
+            "method": method_name,
+            "seed": _extract_seed_from_run_name(run_name),
+            "weight_key": _weight_key_from_run_name(run_name),
+            "run_name": run_name,
+            "run_dir": str(row["run_dir"]),
+            "val_dir": str(row["val_dir"]),
+            "val_ori": _split_ori_logs_by_method(ori_logs, method_name).get(method_name, {"static": {}, "calib": {}}),
+            "val_new": _split_new_logs_by_method(new_logs, method_name).get(method_name, {"static": {}, "calib": {}}),
+        })
+
+    return sorted(candidates, key=lambda row: (row["method"], row["weight_key"], row["seed"], row["run_name"]))
+
+
+def summarize_mean_val_ori_metric(
+    candidates: list[dict],
+    primary_metric: str,
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    rows = []
+    for candidate in candidates:
+        roc_auc, prc_auc = _summarize_ori_metric(candidate["val_ori"], VAL_SPLIT)
+        rows.append({
+            "method": candidate["method"],
+            "seed": candidate["seed"],
+            "weight_key": candidate["weight_key"],
+            "run_name": candidate["run_name"],
+            "run_dir": candidate["run_dir"],
+            "val_split": VAL_SPLIT,
+            "val_roc_auc_early": roc_auc,
+            "val_prc_auc_early": prc_auc,
+        })
+
+    by_seed_df = pd.DataFrame(rows)
+    metric_cols = [
+        "method", "weight_key", "num_seeds", "seed_runs",
+        "mean_val_roc_auc_early", "std_val_roc_auc_early",
+        "mean_val_prc_auc_early", "std_val_prc_auc_early",
+    ]
+    if by_seed_df.empty:
+        empty_seed = pd.DataFrame(columns=[
+            "method", "seed", "weight_key", "run_name", "run_dir", "val_split", "val_roc_auc_early", "val_prc_auc_early",
+        ])
+        empty_weight = pd.DataFrame(columns=metric_cols)
+        return empty_seed, empty_weight, empty_weight.copy()
+
+    agg_rows = []
+    for (method, weight_key), group in by_seed_df.groupby(["method", "weight_key"], dropna=False):
+        agg_rows.append({
+            "method": method,
+            "weight_key": weight_key,
+            "num_seeds": int(group["seed"].dropna().nunique()),
+            "seed_runs": _seed_runs_json(group),
+            "mean_val_roc_auc_early": float(group["val_roc_auc_early"].mean()),
+            "std_val_roc_auc_early": float(group["val_roc_auc_early"].std(ddof=0)),
+            "mean_val_prc_auc_early": float(group["val_prc_auc_early"].mean()),
+            "std_val_prc_auc_early": float(group["val_prc_auc_early"].std(ddof=0)),
+        })
+
+    by_weight_df = pd.DataFrame(agg_rows)
+    primary_col = f"mean_val_{primary_metric}_auc_early"
+    secondary_col = "mean_val_prc_auc_early" if primary_metric == "roc" else "mean_val_roc_auc_early"
+    by_weight_df["missing_score"] = ~np.isfinite(by_weight_df[primary_col].to_numpy(dtype=float))
+    by_weight_df = by_weight_df.sort_values(
+        by=["method", "missing_score", "num_seeds", primary_col, secondary_col, "weight_key"],
+        ascending=[True, True, False, False, False, False],
+        na_position="last",
+        kind="stable",
+    ).reset_index(drop=True)
+    best_df = by_weight_df.drop_duplicates(subset=["method"], keep="first").drop(columns=["missing_score"]).reset_index(drop=True)
+    by_weight_df = by_weight_df.drop(columns=["missing_score"])
+    by_seed_df = by_seed_df.sort_values(by=["method", "weight_key", "seed", "run_name"]).reset_index(drop=True)
+    return by_seed_df, by_weight_df, best_df
+
+
+def _select_common_balacc_range(
+    intervals: list[dict],
+    method: str,
+    mode: str,
+    min_curve_fraction: float,
+    grid_step: float,
+) -> dict:
+    default_stats = {
+        "method": method,
+        "mode": mode,
+        "curve_fraction_target": float(min_curve_fraction),
+        "curve_fraction_achieved": 0.0,
+        "num_curves": 0,
+        "bal_acc_min": np.nan,
+        "bal_acc_max": np.nan,
+        "bal_acc_width": 0.0,
+    }
+    if not intervals:
+        return default_stats
+
+    mins = np.asarray([interval["bal_acc_min"] for interval in intervals], dtype=float)
+    maxs = np.asarray([interval["bal_acc_max"] for interval in intervals], dtype=float)
+    global_min = float(np.min(mins))
+    global_max = float(np.max(maxs))
+    if global_max <= global_min:
+        stats = dict(default_stats)
+        stats.update({
+            "curve_fraction_achieved": 1.0,
+            "num_curves": len(intervals),
+            "bal_acc_min": global_min,
+            "bal_acc_max": global_max,
+            "bal_acc_width": max(0.0, global_max - global_min),
+        })
+        return stats
+
+    lo_start = np.floor(global_min / grid_step) * grid_step
+    hi_end = np.ceil(global_max / grid_step) * grid_step
+    grid = np.round(np.arange(lo_start, hi_end + 0.5 * grid_step, grid_step), 6)
+
+    best_candidate = None
+    fallback_candidate = None
+    num_curves = len(intervals)
+    for lo in grid:
+        for hi in grid:
+            if hi <= lo:
+                continue
+            covered = np.logical_and(mins <= lo, maxs >= hi)
+            curve_fraction = float(np.mean(covered))
+            width = float(hi - lo)
+            stats = {
+                "method": method,
+                "mode": mode,
+                "curve_fraction_target": float(min_curve_fraction),
+                "curve_fraction_achieved": curve_fraction,
+                "num_curves": num_curves,
+                "bal_acc_min": float(lo),
+                "bal_acc_max": float(hi),
+                "bal_acc_width": width,
+            }
+            fallback_key = (curve_fraction, width, float(hi), -float(lo))
+            if fallback_candidate is None or fallback_key > fallback_candidate[0]:
+                fallback_candidate = (fallback_key, stats)
+            if curve_fraction + 1e-12 < min_curve_fraction:
+                continue
+            best_key = (width, curve_fraction, float(hi), -float(lo))
+            if best_candidate is None or best_key > best_candidate[0]:
+                best_candidate = (best_key, stats)
+
+    if best_candidate is not None:
+        return best_candidate[1]
+    if fallback_candidate is not None:
+        return fallback_candidate[1]
+    return default_stats
+
+
+def build_val_pareto_ranges(
+    candidates: list[dict],
+    min_curve_fraction: float,
+    grid_step: float,
+) -> tuple[dict[tuple[str, str], dict], pd.DataFrame]:
+    intervals_by_group: dict[tuple[str, str], list[dict]] = {}
+    for candidate in candidates:
+        calib_logs = candidate["val_new"].get("calib", {})
+        for mode, delta_dict in calib_logs.items():
+            group_key = (candidate["method"], mode)
+            for alpha_dict in delta_dict.values():
+                pareto_det_times, pareto_bal_accs = _get_pareto_curve_from_alpha_dict(_mean_alpha_dict(alpha_dict))
+                if pareto_det_times.size == 0 or pareto_bal_accs.size == 0:
+                    continue
+                intervals_by_group.setdefault(group_key, []).append({
+                    "bal_acc_min": float(np.min(pareto_bal_accs)),
+                    "bal_acc_max": float(np.max(pareto_bal_accs)),
+                })
+
+    rows = []
+    range_by_group = {}
+    for method, mode in sorted(intervals_by_group.keys()):
+        stats = _select_common_balacc_range(
+            intervals_by_group[(method, mode)],
+            method=method,
+            mode=mode,
+            min_curve_fraction=min_curve_fraction,
+            grid_step=grid_step,
+        )
+        range_by_group[(method, mode)] = stats
+        rows.append(stats)
+
+    range_df = pd.DataFrame(rows)
+    if range_df.empty:
+        range_df = pd.DataFrame(columns=[
+            "method", "mode", "curve_fraction_target", "curve_fraction_achieved", "num_curves",
+            "bal_acc_min", "bal_acc_max", "bal_acc_width",
+        ])
+    else:
+        range_df = range_df.sort_values(by=["method", "mode"]).reset_index(drop=True)
+    return range_by_group, range_df
+
+
+def score_val_pareto_candidates(
+    candidates: list[dict],
+    range_by_group: dict[tuple[str, str], dict],
+    penalty_det_time: float,
+) -> pd.DataFrame:
+    rows = []
+    for candidate in candidates:
+        calib_logs = candidate["val_new"].get("calib", {})
+        for mode, delta_dict in calib_logs.items():
+            stats = range_by_group.get((candidate["method"], mode))
+            if stats is None:
+                continue
+            bal_acc_min = stats["bal_acc_min"]
+            bal_acc_max = stats["bal_acc_max"]
+            for delta_key, alpha_dict in delta_dict.items():
+                pareto_det_times, pareto_bal_accs = _get_pareto_curve_from_alpha_dict(_mean_alpha_dict(alpha_dict))
+                score = _compute_penalized_mean_t_at_balacc(
+                    pareto_det_times,
+                    pareto_bal_accs,
+                    bal_acc_min,
+                    bal_acc_max,
+                    penalty_det_time=penalty_det_time,
+                )
+                integral = (
+                    score * (bal_acc_max - bal_acc_min)
+                    if np.isfinite(score) and np.isfinite(bal_acc_min) and np.isfinite(bal_acc_max)
+                    else np.nan
+                )
+                rows.append({
+                    "method": candidate["method"],
+                    "seed": candidate["seed"],
+                    "weight_key": candidate["weight_key"],
+                    "mode": mode,
+                    "delta": float(delta_key),
+                    "run_name": candidate["run_name"],
+                    "run_dir": candidate["run_dir"],
+                    "val_bal_acc_min": bal_acc_min,
+                    "val_bal_acc_max": bal_acc_max,
+                    "val_bal_acc_width": stats["bal_acc_width"],
+                    "val_curve_fraction_achieved": stats["curve_fraction_achieved"],
+                    "val_penalty_det_time": float(penalty_det_time),
+                    "val_pareto_points": int(len(pareto_det_times)),
+                    "val_pareto_coverage": _compute_pareto_balacc_coverage(
+                        pareto_bal_accs,
+                        bal_acc_min,
+                        bal_acc_max,
+                    ),
+                    "val_pareto_max_bal_acc": _compute_max_bal_acc_from_pareto(pareto_bal_accs),
+                    "val_penalized_mean_t_at_balacc": score,
+                    "val_integral_t_at_balacc": integral,
+                })
+
+    score_df = pd.DataFrame(rows)
+    if score_df.empty:
+        return pd.DataFrame(columns=[
+            "method", "seed", "weight_key", "mode", "delta", "run_name", "run_dir",
+            "val_bal_acc_min", "val_bal_acc_max", "val_bal_acc_width", "val_curve_fraction_achieved",
+            "val_penalty_det_time", "val_pareto_points", "val_pareto_coverage", "val_pareto_max_bal_acc",
+            "val_penalized_mean_t_at_balacc", "val_integral_t_at_balacc",
+        ])
+    return score_df.sort_values(by=["method", "mode", "weight_key", "seed", "delta", "run_name"]).reset_index(drop=True)
+
+
+def summarize_mean_val_pareto(
+    candidates: list[dict],
+    min_curve_fraction: float = AUTO_COMMON_BAL_ACC_MIN_CURVE_FRACTION,
+    grid_step: float = AUTO_COMMON_BAL_ACC_GRID_STEP,
+    penalty_det_time: float = PENALIZED_DET_TIME,
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    range_by_group, range_df = build_val_pareto_ranges(candidates, min_curve_fraction=min_curve_fraction, grid_step=grid_step)
+    by_seed_df = score_val_pareto_candidates(candidates, range_by_group=range_by_group, penalty_det_time=penalty_det_time)
+    agg_cols = [
+        "method", "mode", "weight_key", "delta", "num_seeds", "seed_runs",
+        "mean_val_bal_acc_min", "mean_val_bal_acc_max", "mean_val_bal_acc_width",
+        "mean_val_curve_fraction_achieved", "mean_val_penalty_det_time",
+        "mean_val_pareto_points", "mean_val_pareto_coverage", "mean_val_pareto_max_bal_acc",
+        "mean_val_penalized_mean_t_at_balacc", "std_val_penalized_mean_t_at_balacc",
+        "mean_val_integral_t_at_balacc", "std_val_integral_t_at_balacc",
+    ]
+    if by_seed_df.empty:
+        empty = pd.DataFrame(columns=agg_cols)
+        return range_df, by_seed_df, empty, empty.copy()
+
+    agg_rows = []
+    for (method, mode, weight_key, delta), group in by_seed_df.groupby(["method", "mode", "weight_key", "delta"], dropna=False):
+        agg_rows.append({
+            "method": method,
+            "mode": mode,
+            "weight_key": weight_key,
+            "delta": float(delta),
+            "num_seeds": int(group["seed"].dropna().nunique()),
+            "seed_runs": _seed_runs_json(group),
+            "mean_val_bal_acc_min": float(group["val_bal_acc_min"].mean()),
+            "mean_val_bal_acc_max": float(group["val_bal_acc_max"].mean()),
+            "mean_val_bal_acc_width": float(group["val_bal_acc_width"].mean()),
+            "mean_val_curve_fraction_achieved": float(group["val_curve_fraction_achieved"].mean()),
+            "mean_val_penalty_det_time": float(group["val_penalty_det_time"].mean()),
+            "mean_val_pareto_points": float(group["val_pareto_points"].mean()),
+            "mean_val_pareto_coverage": float(group["val_pareto_coverage"].mean()),
+            "mean_val_pareto_max_bal_acc": float(group["val_pareto_max_bal_acc"].mean()),
+            "mean_val_penalized_mean_t_at_balacc": float(group["val_penalized_mean_t_at_balacc"].mean()),
+            "std_val_penalized_mean_t_at_balacc": float(group["val_penalized_mean_t_at_balacc"].std(ddof=0)),
+            "mean_val_integral_t_at_balacc": float(group["val_integral_t_at_balacc"].mean()),
+            "std_val_integral_t_at_balacc": float(group["val_integral_t_at_balacc"].std(ddof=0)),
+        })
+
+    by_weight_df = pd.DataFrame(agg_rows)
+    by_weight_df["missing_score"] = ~np.isfinite(by_weight_df["mean_val_integral_t_at_balacc"].to_numpy(dtype=float))
+    by_weight_df = by_weight_df.sort_values(
+        by=[
+            "method", "mode", "missing_score", "num_seeds",
+            "mean_val_integral_t_at_balacc", "mean_val_penalized_mean_t_at_balacc", "delta", "weight_key",
+        ],
+        ascending=[True, True, True, False, True, True, True, False],
+        na_position="last",
+        kind="stable",
+    ).reset_index(drop=True)
+    best_df = by_weight_df.drop_duplicates(subset=["method", "mode"], keep="first").drop(columns=["missing_score"]).reset_index(drop=True)
+    by_weight_df = by_weight_df.drop(columns=["missing_score"])
+    return range_df, by_seed_df, by_weight_df, best_df
+
+
+def write_val_selection_summaries(
+    rows: list[dict],
+    save_dir: str,
+    min_curve_fraction: float = AUTO_COMMON_BAL_ACC_MIN_CURVE_FRACTION,
+    grid_step: float = AUTO_COMMON_BAL_ACC_GRID_STEP,
+    penalty_det_time: float = PENALIZED_DET_TIME,
+) -> dict:
+    candidates = collect_val_candidates_from_rows(rows)
+    if not candidates:
+        return {}
+
+    roc_seed_df, roc_weight_df, roc_best_df = summarize_mean_val_ori_metric(candidates, primary_metric="roc")
+    prc_seed_df, prc_weight_df, prc_best_df = summarize_mean_val_ori_metric(candidates, primary_metric="prc")
+    range_df, pareto_seed_df, pareto_weight_df, pareto_best_df = summarize_mean_val_pareto(
+        candidates,
+        min_curve_fraction=min_curve_fraction,
+        grid_step=grid_step,
+        penalty_det_time=penalty_det_time,
+    )
+
+    roc_dir = os.path.join(save_dir, "roc_auc")
+    prc_dir = os.path.join(save_dir, "prc_auc")
+    pareto_dir = os.path.join(save_dir, "pareto")
+
+    _write_dataframe(roc_seed_df, os.path.join(roc_dir, "candidates_by_seed.csv"))
+    _write_dataframe(roc_weight_df, os.path.join(roc_dir, "weights_mean_across_seeds.csv"))
+    _write_dataframe(roc_best_df, os.path.join(roc_dir, "best_weights.csv"))
+    _save_payload(os.path.join(roc_dir, "summary.json"), {
+        "strategy": "roc_auc",
+        "num_candidates": int(len(roc_seed_df)),
+        "num_weight_groups": int(len(roc_weight_df)),
+        "best_weights": _to_jsonable_records(roc_best_df),
+    })
+
+    _write_dataframe(prc_seed_df, os.path.join(prc_dir, "candidates_by_seed.csv"))
+    _write_dataframe(prc_weight_df, os.path.join(prc_dir, "weights_mean_across_seeds.csv"))
+    _write_dataframe(prc_best_df, os.path.join(prc_dir, "best_weights.csv"))
+    _save_payload(os.path.join(prc_dir, "summary.json"), {
+        "strategy": "prc_auc",
+        "num_candidates": int(len(prc_seed_df)),
+        "num_weight_groups": int(len(prc_weight_df)),
+        "best_weights": _to_jsonable_records(prc_best_df),
+    })
+
+    _write_dataframe(range_df, os.path.join(pareto_dir, "bal_acc_ranges_by_method_mode.csv"))
+    _write_dataframe(pareto_seed_df, os.path.join(pareto_dir, "candidates_by_seed.csv"))
+    _write_dataframe(pareto_weight_df, os.path.join(pareto_dir, "weights_mean_across_seeds.csv"))
+    _write_dataframe(pareto_best_df, os.path.join(pareto_dir, "best_weights.csv"))
+    _save_payload(os.path.join(pareto_dir, "summary.json"), {
+        "strategy": "pareto_integral_t_at_balacc",
+        "num_candidates": int(len(pareto_seed_df)),
+        "num_weight_groups": int(len(pareto_weight_df)),
+        "bal_acc_ranges": _to_jsonable_records(range_df),
+        "best_weights": _to_jsonable_records(pareto_best_df),
+    })
+
+    return {
+        "roc_auc_summary": os.path.join(roc_dir, "summary.json"),
+        "roc_auc_best_weights": os.path.join(roc_dir, "best_weights.csv"),
+        "prc_auc_summary": os.path.join(prc_dir, "summary.json"),
+        "prc_auc_best_weights": os.path.join(prc_dir, "best_weights.csv"),
+        "pareto_summary": os.path.join(pareto_dir, "summary.json"),
+        "pareto_best_weights": os.path.join(pareto_dir, "best_weights.csv"),
+    }
+
+
 def evaluate_run(log_dir: str, logs_dir: str) -> dict:
     cfg = OmegaConf.load(os.path.join(log_dir, "config.yaml"))
     _clear_redundant_data_path_prefix(cfg)
@@ -431,11 +900,13 @@ def run_batch_validation(logs_dir: str, save_dir: str) -> dict:
         with open(os.path.join(save_dir, "val_failures.json"), "w") as f:
             json.dump(failures, f, indent=2)
 
+    selection_payload = write_val_selection_summaries(rows, save_dir)
     payload = {
         "logs_dir": logs_dir,
         "save_dir": save_dir,
         "num_runs": len(rows),
         "num_failures": len(failures),
+        **selection_payload,
     }
     with open(os.path.join(save_dir, "val_summary.json"), "w") as f:
         json.dump(payload, f, indent=2)

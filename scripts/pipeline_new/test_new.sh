@@ -2,17 +2,18 @@
 
 set -euo pipefail
 
-# Run test-stage comparison using the selection exported by val_new.py.
+# Read the best validation weights for ROC-AUC, PRC-AUC, and Pareto integral t@bal_acc,
+# run test eval on those selected runs, and summarize the resulting metrics.
 #
 # Usage:
-#   scripts/pipeline_new/test_new.sh <selection_path>
-#   scripts/pipeline_new/test_new.sh log_ckpt <selection_path>
-#   scripts/pipeline_new/test_new.sh log_ckpt <selection_path> /tmp/test_new
-
-if [ "$#" -lt 1 ] || [ "$#" -gt 3 ]; then
-    echo "Usage: $0 [logs_dir] <selection_path> [save_dir]" >&2
-    exit 1
-fi
+#   scripts/pipeline_new/test_new.sh
+#   scripts/pipeline_new/test_new.sh --logs-dir log_ckpt_new/pizero_fast
+#   scripts/pipeline_new/test_new.sh --gpu 0 log_ckpt_new/pizero_fast /tmp/test_new
+#   scripts/pipeline_new/test_new.sh --force-eval --min-curve-fraction 0.7
+#
+# Notes:
+#   - Uses pipeline_val_new/{roc_auc,prc_auc,pareto}/best_weights.csv when available.
+#   - If those files are missing but pipeline_val_new/val_summary.csv exists, they are rebuilt automatically.
 
 resolve_default_logs_dir() {
     if [ -n "${PIPELINE_NEW_LOGS_DIR:-}" ]; then
@@ -31,18 +32,72 @@ resolve_default_logs_dir() {
     exit 1
 }
 
-if [ "$#" -eq 1 ]; then
-    logs_dir="$(realpath "$(resolve_default_logs_dir)")"
-    selection_path="$(realpath "$1")"
-    save_dir="${logs_dir}/pipeline_test_new"
-elif [ "$#" -eq 2 ]; then
-    logs_dir="$(realpath "$1")"
-    selection_path="$(realpath "$2")"
-    save_dir="${logs_dir}/pipeline_test_new"
+gpu_id="${CUDA_VISIBLE_DEVICES:-}"
+logs_dir=""
+save_dir=""
+extra_args=()
+
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --gpu)
+            if [ "$#" -lt 2 ]; then
+                echo "Missing value for --gpu" >&2
+                exit 1
+            fi
+            gpu_id="$2"
+            shift 2
+            ;;
+        --logs-dir)
+            if [ "$#" -lt 2 ]; then
+                echo "Missing value for --logs-dir" >&2
+                exit 1
+            fi
+            logs_dir="$2"
+            shift 2
+            ;;
+        --save-dir)
+            if [ "$#" -lt 2 ]; then
+                echo "Missing value for --save-dir" >&2
+                exit 1
+            fi
+            save_dir="$2"
+            shift 2
+            ;;
+        --force-eval)
+            extra_args+=("$1")
+            shift
+            ;;
+        --min-curve-fraction|--grid-step|--penalty-det-time)
+            if [ "$#" -lt 2 ]; then
+                echo "Missing value for $1" >&2
+                exit 1
+            fi
+            extra_args+=("$1" "$2")
+            shift 2
+            ;;
+        -h|--help)
+            sed -n '1,14p' "$0"
+            exit 0
+            ;;
+        *)
+            if [ -z "${logs_dir}" ]; then
+                logs_dir="$1"
+                shift
+            elif [ -z "${save_dir}" ]; then
+                save_dir="$1"
+                shift
+            else
+                echo "Unknown argument: $1" >&2
+                exit 1
+            fi
+            ;;
+    esac
+done
+
+if [ -n "${logs_dir}" ]; then
+    logs_dir="$(realpath "${logs_dir}")"
 else
-    logs_dir="$(realpath "$1")"
-    selection_path="$(realpath "$2")"
-    save_dir="$(realpath "$3")"
+    logs_dir="$(realpath "$(resolve_default_logs_dir)")"
 fi
 
 if [ ! -d "${logs_dir}" ]; then
@@ -50,20 +105,28 @@ if [ ! -d "${logs_dir}" ]; then
     exit 1
 fi
 
-if [ ! -f "${selection_path}" ]; then
-    echo "Selection file not found: ${selection_path}" >&2
-    exit 1
+if [ -n "${save_dir}" ]; then
+    save_dir="$(realpath "${save_dir}")"
+else
+    save_dir="${logs_dir}/pipeline_test_new"
 fi
 
 cmd=(
     python -m failure_prob.pipeline.test_new
     --logs-dir "${logs_dir}"
-    --selection-path "${selection_path}"
     --save-dir "${save_dir}"
+    "${extra_args[@]}"
 )
 
 printf 'Running:'
+if [ -n "${gpu_id}" ]; then
+    printf ' %q' "CUDA_VISIBLE_DEVICES=${gpu_id}"
+fi
 printf ' %q' "${cmd[@]}"
 printf '\n'
 
-env PYTHONPATH=. "${cmd[@]}"
+if [ -n "${gpu_id}" ]; then
+    CUDA_VISIBLE_DEVICES="${gpu_id}" env PYTHONPATH=. "${cmd[@]}"
+else
+    env PYTHONPATH=. "${cmd[@]}"
+fi
