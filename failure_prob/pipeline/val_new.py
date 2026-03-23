@@ -30,8 +30,6 @@ from failure_prob.eval import (
 from failure_prob.model import get_model
 from failure_prob.model.base import BaseModel
 from failure_prob.mrefine.delay_summary import (
-    AUTO_COMMON_BAL_ACC_GRID_STEP,
-    AUTO_COMMON_BAL_ACC_MIN_CURVE_FRACTION,
     PENALIZED_DET_TIME,
     _compute_max_bal_acc_from_pareto,
     _compute_pareto_balacc_coverage,
@@ -58,6 +56,8 @@ VAL_SPLITS = ("train", "val_seen", "val_unseen")
 ALPHAS = [0.02, 0.05, 0.1, 0.15, 0.2, 0.25, 0.3, 0.35, 0.4, 0.45, 0.5, 0.6, 0.7, 0.8, 0.9]
 
 VAL_SPLIT = VAL_SPLITS[-1]
+PARETO_INTEGRAL_BAL_ACC_MIN = 0.7
+PARETO_INTEGRAL_BAL_ACC_MAX = 1.0
 
 
 def _resolve_default_logs_dir() -> str:
@@ -163,6 +163,10 @@ def _build_model_scores(
     model: BaseModel = get_model(cfg, input_dim)
     model, _ = load_model_checkpoint(model, ckpt_path)
     model.to("cuda")
+    if cfg.model.name == "embed" and not getattr(model, "trained", True):
+        print("Rebuilding embed state from the training split for validation")
+        train_dataloader = DataLoader(datasets["train"], batch_size=cfg.model.batch_size, shuffle=False, num_workers=0)
+        model.train_epoch(None, train_dataloader, force_retrain=True)
     model.eval()
 
     scores_by_split_name = {}
@@ -489,85 +493,35 @@ def summarize_mean_val_ori_metric(
     return by_seed_df, by_weight_df, best_df
 
 
-def _select_common_balacc_range(
+def _build_fixed_balacc_range(
     intervals: list[dict],
     method: str,
     mode: str,
-    min_curve_fraction: float,
-    grid_step: float,
+    bal_acc_min: float,
+    bal_acc_max: float,
 ) -> dict:
-    default_stats = {
+    coverage_fraction = 0.0
+    if intervals and bal_acc_max > bal_acc_min:
+        mins = np.asarray([interval["bal_acc_min"] for interval in intervals], dtype=float)
+        maxs = np.asarray([interval["bal_acc_max"] for interval in intervals], dtype=float)
+        coverage_fraction = float(np.mean(np.logical_and(mins <= bal_acc_min, maxs >= bal_acc_max)))
+
+    return {
         "method": method,
         "mode": mode,
-        "curve_fraction_target": float(min_curve_fraction),
-        "curve_fraction_achieved": 0.0,
-        "num_curves": 0,
-        "bal_acc_min": np.nan,
-        "bal_acc_max": np.nan,
-        "bal_acc_width": 0.0,
+        "curve_fraction_target": 1.0,
+        "curve_fraction_achieved": coverage_fraction,
+        "num_curves": len(intervals),
+        "bal_acc_min": float(bal_acc_min),
+        "bal_acc_max": float(bal_acc_max),
+        "bal_acc_width": max(0.0, float(bal_acc_max) - float(bal_acc_min)),
     }
-    if not intervals:
-        return default_stats
-
-    mins = np.asarray([interval["bal_acc_min"] for interval in intervals], dtype=float)
-    maxs = np.asarray([interval["bal_acc_max"] for interval in intervals], dtype=float)
-    global_min = float(np.min(mins))
-    global_max = float(np.max(maxs))
-    if global_max <= global_min:
-        stats = dict(default_stats)
-        stats.update({
-            "curve_fraction_achieved": 1.0,
-            "num_curves": len(intervals),
-            "bal_acc_min": global_min,
-            "bal_acc_max": global_max,
-            "bal_acc_width": max(0.0, global_max - global_min),
-        })
-        return stats
-
-    lo_start = np.floor(global_min / grid_step) * grid_step
-    hi_end = np.ceil(global_max / grid_step) * grid_step
-    grid = np.round(np.arange(lo_start, hi_end + 0.5 * grid_step, grid_step), 6)
-
-    best_candidate = None
-    fallback_candidate = None
-    num_curves = len(intervals)
-    for lo in grid:
-        for hi in grid:
-            if hi <= lo:
-                continue
-            covered = np.logical_and(mins <= lo, maxs >= hi)
-            curve_fraction = float(np.mean(covered))
-            width = float(hi - lo)
-            stats = {
-                "method": method,
-                "mode": mode,
-                "curve_fraction_target": float(min_curve_fraction),
-                "curve_fraction_achieved": curve_fraction,
-                "num_curves": num_curves,
-                "bal_acc_min": float(lo),
-                "bal_acc_max": float(hi),
-                "bal_acc_width": width,
-            }
-            fallback_key = (curve_fraction, width, float(hi), -float(lo))
-            if fallback_candidate is None or fallback_key > fallback_candidate[0]:
-                fallback_candidate = (fallback_key, stats)
-            if curve_fraction + 1e-12 < min_curve_fraction:
-                continue
-            best_key = (width, curve_fraction, float(hi), -float(lo))
-            if best_candidate is None or best_key > best_candidate[0]:
-                best_candidate = (best_key, stats)
-
-    if best_candidate is not None:
-        return best_candidate[1]
-    if fallback_candidate is not None:
-        return fallback_candidate[1]
-    return default_stats
 
 
 def build_val_pareto_ranges(
     candidates: list[dict],
-    min_curve_fraction: float,
-    grid_step: float,
+    bal_acc_min: float,
+    bal_acc_max: float,
 ) -> tuple[dict[tuple[str, str], dict], pd.DataFrame]:
     intervals_by_group: dict[tuple[str, str], list[dict]] = {}
     for candidate in candidates:
@@ -584,14 +538,19 @@ def build_val_pareto_ranges(
                 })
 
     rows = []
+    all_group_keys = sorted({
+        (candidate["method"], mode)
+        for candidate in candidates
+        for mode in candidate["val_new"].get("calib", {}).keys()
+    })
     range_by_group = {}
-    for method, mode in sorted(intervals_by_group.keys()):
-        stats = _select_common_balacc_range(
-            intervals_by_group[(method, mode)],
+    for method, mode in all_group_keys:
+        stats = _build_fixed_balacc_range(
+            intervals_by_group.get((method, mode), []),
             method=method,
             mode=mode,
-            min_curve_fraction=min_curve_fraction,
-            grid_step=grid_step,
+            bal_acc_min=bal_acc_min,
+            bal_acc_max=bal_acc_max,
         )
         range_by_group[(method, mode)] = stats
         rows.append(stats)
@@ -672,11 +631,15 @@ def score_val_pareto_candidates(
 
 def summarize_mean_val_pareto(
     candidates: list[dict],
-    min_curve_fraction: float = AUTO_COMMON_BAL_ACC_MIN_CURVE_FRACTION,
-    grid_step: float = AUTO_COMMON_BAL_ACC_GRID_STEP,
+    bal_acc_min: float = PARETO_INTEGRAL_BAL_ACC_MIN,
+    bal_acc_max: float = PARETO_INTEGRAL_BAL_ACC_MAX,
     penalty_det_time: float = PENALIZED_DET_TIME,
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-    range_by_group, range_df = build_val_pareto_ranges(candidates, min_curve_fraction=min_curve_fraction, grid_step=grid_step)
+    range_by_group, range_df = build_val_pareto_ranges(
+        candidates,
+        bal_acc_min=bal_acc_min,
+        bal_acc_max=bal_acc_max,
+    )
     by_seed_df = score_val_pareto_candidates(candidates, range_by_group=range_by_group, penalty_det_time=penalty_det_time)
     agg_cols = [
         "method", "mode", "weight_key", "delta", "num_seeds", "seed_runs",
@@ -732,8 +695,8 @@ def summarize_mean_val_pareto(
 def write_val_selection_summaries(
     rows: list[dict],
     save_dir: str,
-    min_curve_fraction: float = AUTO_COMMON_BAL_ACC_MIN_CURVE_FRACTION,
-    grid_step: float = AUTO_COMMON_BAL_ACC_GRID_STEP,
+    bal_acc_min: float = PARETO_INTEGRAL_BAL_ACC_MIN,
+    bal_acc_max: float = PARETO_INTEGRAL_BAL_ACC_MAX,
     penalty_det_time: float = PENALIZED_DET_TIME,
 ) -> dict:
     candidates = collect_val_candidates_from_rows(rows)
@@ -744,8 +707,8 @@ def write_val_selection_summaries(
     prc_seed_df, prc_weight_df, prc_best_df = summarize_mean_val_ori_metric(candidates, primary_metric="prc")
     range_df, pareto_seed_df, pareto_weight_df, pareto_best_df = summarize_mean_val_pareto(
         candidates,
-        min_curve_fraction=min_curve_fraction,
-        grid_step=grid_step,
+        bal_acc_min=bal_acc_min,
+        bal_acc_max=bal_acc_max,
         penalty_det_time=penalty_det_time,
     )
 
@@ -779,6 +742,8 @@ def write_val_selection_summaries(
     _write_dataframe(pareto_best_df, os.path.join(pareto_dir, "best_weights.csv"))
     _save_payload(os.path.join(pareto_dir, "summary.json"), {
         "strategy": "pareto_integral_t_at_balacc",
+        "integral_bal_acc_min": float(bal_acc_min),
+        "integral_bal_acc_max": float(bal_acc_max),
         "num_candidates": int(len(pareto_seed_df)),
         "num_weight_groups": int(len(pareto_weight_df)),
         "bal_acc_ranges": _to_jsonable_records(range_df),

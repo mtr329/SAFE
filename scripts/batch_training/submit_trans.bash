@@ -26,7 +26,7 @@ SEEDS=0-1-2
 run_pi0() {
   # Moderate sweep for pi0_libero:
   # - focus on feature extraction indices + mild regularization
-  python -m failure_prob.train \
+  python -m failure_prob.pipeline.train_new \
     --multirun \
     train.wandb_group_name=pi0diff_libero_v1 \
     train.wandb_dir="${WANDB_DIR}/pi0_libero" \
@@ -51,7 +51,7 @@ run_pi0() {
 
 run_pi0fast() {
   # Keep the current best-known pi0fast settings fixed.
-  python -m failure_prob.train \
+  python -m failure_prob.pipeline.train_new \
     --multirun \
     train.wandb_group_name=pi0fast_libero_v4 \
     train.wandb_dir="${WANDB_DIR}/pi0fast_libero" \
@@ -77,7 +77,7 @@ run_pi0fast() {
 run_openvla() {
   # Unseen-generalization-focused sweep for openvla_libero.
   # Based on current best region: token_idx_rel=concat-2, lr~1e-5, lambda_reg~0.3.
-  python -m failure_prob.train \
+  python -m failure_prob.pipeline.train_new \
     --multirun \
     train.wandb_group_name=openvla_libero_v2 \
     train.wandb_dir="${WANDB_DIR}/openvla" \

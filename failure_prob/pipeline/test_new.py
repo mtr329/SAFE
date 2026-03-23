@@ -17,8 +17,6 @@ if str(REPO_ROOT) not in sys.path:
 
 from failure_prob.eval import collect_eval_dirs, evaluate_cfg
 from failure_prob.mrefine.delay_summary import (
-    AUTO_COMMON_BAL_ACC_GRID_STEP,
-    AUTO_COMMON_BAL_ACC_MIN_CURVE_FRACTION,
     PENALIZED_DET_TIME,
     _compute_max_bal_acc_from_pareto,
     _compute_pareto_balacc_coverage,
@@ -37,6 +35,8 @@ from failure_prob.pipeline.val_new import (
 from failure_prob.utils.split_io import _dataset_hash_payload, load_split_signature
 
 VAL_SPLIT = VAL_SPLITS[-1]
+PARETO_INTEGRAL_BAL_ACC_MIN = 0.7
+PARETO_INTEGRAL_BAL_ACC_MAX = 1.0
 
 
 def _extract_seed(cfg, run_name: str) -> int | None:
@@ -241,85 +241,35 @@ def summarize_val_roc_auc(candidates: list[dict]) -> tuple[pd.DataFrame, pd.Data
     return score_df, selected_df
 
 
-def _select_common_balacc_range(
+def _build_fixed_balacc_range(
     intervals: list[dict],
     method: str,
     mode: str,
-    min_curve_fraction: float,
-    grid_step: float,
+    bal_acc_min: float,
+    bal_acc_max: float,
 ) -> dict:
-    default_stats = {
+    coverage_fraction = 0.0
+    if intervals and bal_acc_max > bal_acc_min:
+        mins = np.asarray([interval["bal_acc_min"] for interval in intervals], dtype=float)
+        maxs = np.asarray([interval["bal_acc_max"] for interval in intervals], dtype=float)
+        coverage_fraction = float(np.mean(np.logical_and(mins <= bal_acc_min, maxs >= bal_acc_max)))
+
+    return {
         "method": method,
         "mode": mode,
-        "curve_fraction_target": float(min_curve_fraction),
-        "curve_fraction_achieved": 0.0,
-        "num_curves": 0,
-        "bal_acc_min": np.nan,
-        "bal_acc_max": np.nan,
-        "bal_acc_width": 0.0,
+        "curve_fraction_target": 1.0,
+        "curve_fraction_achieved": coverage_fraction,
+        "num_curves": len(intervals),
+        "bal_acc_min": float(bal_acc_min),
+        "bal_acc_max": float(bal_acc_max),
+        "bal_acc_width": max(0.0, float(bal_acc_max) - float(bal_acc_min)),
     }
-    if not intervals:
-        return default_stats
-
-    mins = np.asarray([interval["bal_acc_min"] for interval in intervals], dtype=float)
-    maxs = np.asarray([interval["bal_acc_max"] for interval in intervals], dtype=float)
-    global_min = float(np.min(mins))
-    global_max = float(np.max(maxs))
-    if global_max <= global_min:
-        stats = dict(default_stats)
-        stats.update({
-            "curve_fraction_achieved": 1.0,
-            "num_curves": len(intervals),
-            "bal_acc_min": global_min,
-            "bal_acc_max": global_max,
-            "bal_acc_width": max(0.0, global_max - global_min),
-        })
-        return stats
-
-    lo_start = np.floor(global_min / grid_step) * grid_step
-    hi_end = np.ceil(global_max / grid_step) * grid_step
-    grid = np.round(np.arange(lo_start, hi_end + 0.5 * grid_step, grid_step), 6)
-
-    best_candidate = None
-    fallback_candidate = None
-    num_curves = len(intervals)
-    for lo in grid:
-        for hi in grid:
-            if hi <= lo:
-                continue
-            covered = np.logical_and(mins <= lo, maxs >= hi)
-            curve_fraction = float(np.mean(covered))
-            width = float(hi - lo)
-            stats = {
-                "method": method,
-                "mode": mode,
-                "curve_fraction_target": float(min_curve_fraction),
-                "curve_fraction_achieved": curve_fraction,
-                "num_curves": num_curves,
-                "bal_acc_min": float(lo),
-                "bal_acc_max": float(hi),
-                "bal_acc_width": width,
-            }
-            fallback_key = (curve_fraction, width, float(hi), -float(lo))
-            if fallback_candidate is None or fallback_key > fallback_candidate[0]:
-                fallback_candidate = (fallback_key, stats)
-            if curve_fraction + 1e-12 < min_curve_fraction:
-                continue
-            best_key = (width, curve_fraction, float(hi), -float(lo))
-            if best_candidate is None or best_key > best_candidate[0]:
-                best_candidate = (best_key, stats)
-
-    if best_candidate is not None:
-        return best_candidate[1]
-    if fallback_candidate is not None:
-        return fallback_candidate[1]
-    return default_stats
 
 
 def build_val_pareto_ranges(
     candidates: list[dict],
-    min_curve_fraction: float,
-    grid_step: float,
+    bal_acc_min: float,
+    bal_acc_max: float,
 ) -> tuple[dict[tuple[str, str], dict], pd.DataFrame]:
     intervals_by_group: dict[tuple[str, str], list[dict]] = {}
     for candidate in candidates:
@@ -337,14 +287,19 @@ def build_val_pareto_ranges(
                 })
 
     rows = []
+    all_group_keys = sorted({
+        (candidate["method"], mode)
+        for candidate in candidates
+        for mode in candidate["val_new"].get("calib", {}).keys()
+    })
     range_by_group = {}
-    for method, mode in sorted(intervals_by_group.keys()):
-        stats = _select_common_balacc_range(
-            intervals_by_group[(method, mode)],
+    for method, mode in all_group_keys:
+        stats = _build_fixed_balacc_range(
+            intervals_by_group.get((method, mode), []),
             method=method,
             mode=mode,
-            min_curve_fraction=min_curve_fraction,
-            grid_step=grid_step,
+            bal_acc_min=bal_acc_min,
+            bal_acc_max=bal_acc_max,
         )
         range_by_group[(method, mode)] = stats
         rows.append(stats)
@@ -613,7 +568,12 @@ def _remove_test_curve_outputs(save_dir: str) -> None:
         if name in {"ori_roc_curve_points.csv", "ori_pr_curve_points.csv"}:
             os.remove(path)
             continue
+        if name == "avg_det_time_vs_bal_acc_points.csv":
+            os.remove(path)
+            continue
         if not name.startswith("ori_"):
+            if name.startswith("avg_det_time_vs_bal_acc_") and name.endswith(".png"):
+                os.remove(path)
             continue
         if name.endswith("_roc.png") or name.endswith("_pr.png"):
             os.remove(path)
@@ -641,64 +601,151 @@ def _merge_mean_alpha_dicts(alpha_dicts: list[dict]) -> dict:
     return output
 
 
-def save_selected_test_bal_acc_curves(save_dir: str, selected_df: pd.DataFrame, test_logs_by_key: dict) -> None:
-    curve_rows = []
-    if selected_df.empty:
-        return
+def _safe_file_stem(value) -> str:
+    text = str(value)
+    return "".join(ch if ch.isalnum() or ch in {"-", "_"} else "_" for ch in text)
 
-    for mode, mode_df in selected_df.groupby("mode", dropna=False):
-        fig = Figure(figsize=(7, 5))
-        ax = fig.subplots()
-        plotted = False
 
-        for method, method_df in sorted(mode_df.groupby("method", dropna=False), key=lambda item: str(item[0])):
-            alpha_dicts = []
-            for row in method_df.itertuples(index=False):
-                test_logs = test_logs_by_key.get((row.run_dir, row.method))
-                if test_logs is None:
-                    continue
-                calib_logs = test_logs["new"].get("calib", {}).get(row.mode, {})
-                _, alpha_dict = _find_delta_entry(calib_logs, float(row.delta))
-                if alpha_dict is not None:
-                    alpha_dicts.append(alpha_dict)
+def _mean_ori_curve_points(selected_df: pd.DataFrame, test_logs_by_key: dict, eval_time: str) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    alpha_to_avg_det_times: dict[float, list[float]] = {}
+    alpha_to_bal_accs: dict[float, list[float]] = {}
 
-            if not alpha_dicts:
-                continue
-
-            pareto_det_times, pareto_bal_accs = _get_pareto_curve_from_alpha_dict(_merge_mean_alpha_dicts(alpha_dicts))
-            if pareto_det_times.size == 0 or pareto_bal_accs.size == 0:
-                continue
-
-            order = np.argsort(np.asarray(pareto_bal_accs, dtype=float))
-            bal_accs = np.asarray(pareto_bal_accs, dtype=float)[order]
-            det_times = np.asarray(pareto_det_times, dtype=float)[order]
-            ax.plot(bal_accs, det_times, linewidth=2.0, label=str(method))
-            plotted = True
-
-            for bal_acc, det_time in zip(bal_accs, det_times):
-                curve_rows.append({
-                    "method": method,
-                    "mode": mode,
-                    "bal_acc": float(bal_acc),
-                    "avg_det_time": float(det_time),
-                })
-
-        if not plotted:
+    for row in selected_df.itertuples(index=False):
+        test_logs = test_logs_by_key.get((row.run_dir, row.method))
+        if test_logs is None:
             continue
+        calib_logs = test_logs["ori"].get("calib", {}).get(eval_time, {})
+        if not calib_logs:
+            continue
+        for alpha_str, alpha_dict in calib_logs.items():
+            if "avg_det_time" not in alpha_dict or "bal_acc" not in alpha_dict:
+                continue
+            alpha = float(alpha_str)
+            alpha_to_avg_det_times.setdefault(alpha, []).append(
+                float(np.asarray(alpha_dict["avg_det_time"], dtype=float).mean())
+            )
+            alpha_to_bal_accs.setdefault(alpha, []).append(
+                float(np.asarray(alpha_dict["bal_acc"], dtype=float).mean())
+            )
 
-        ax.set_xlabel("Balanced Accuracy")
-        ax.set_ylabel("Average Detection Time")
-        ax.set_title(f"Test Avg Detection Time vs Balanced Accuracy ({mode})")
-        ax.grid(True, alpha=0.3)
-        ax.legend()
-        fig.tight_layout()
-        fig.savefig(os.path.join(save_dir, f"avg_det_time_vs_bal_acc_{mode}.png"), dpi=300)
+    rows = []
+    for alpha in sorted(alpha_to_avg_det_times):
+        if alpha not in alpha_to_bal_accs:
+            continue
+        rows.append((
+            float(alpha),
+            float(np.mean(alpha_to_avg_det_times[alpha])),
+            float(np.mean(alpha_to_bal_accs[alpha])),
+        ))
+
+    if not rows:
+        return np.asarray([], dtype=float), np.asarray([], dtype=float), np.asarray([], dtype=float)
+
+    alpha_values = np.asarray([row[0] for row in rows], dtype=float)
+    avg_det_times = np.asarray([row[1] for row in rows], dtype=float)
+    bal_accs = np.asarray([row[2] for row in rows], dtype=float)
+    return alpha_values, avg_det_times, bal_accs
+
+
+def save_test_selection_curves(
+    save_dir: str,
+    roc_selected_df: pd.DataFrame,
+    prc_selected_df: pd.DataFrame,
+    pareto_selected_df: pd.DataFrame,
+    test_logs_by_key: dict,
+) -> dict[str, str]:
+    plot_dir = os.path.join(save_dir, "selection_curves")
+    os.makedirs(plot_dir, exist_ok=True)
+    _remove_test_curve_outputs(plot_dir)
+
+    curve_rows = []
+    outputs: dict[str, str] = {"selection_curves_dir": plot_dir}
+    methods = sorted({
+        *roc_selected_df.get("method", pd.Series(dtype=object)).dropna().tolist(),
+        *prc_selected_df.get("method", pd.Series(dtype=object)).dropna().tolist(),
+        *pareto_selected_df.get("method", pd.Series(dtype=object)).dropna().tolist(),
+    }, key=str)
+
+    strategy_inputs = [
+        ("roc_auc", "Selected By Val ROC", "#1f77b4", "-", "o", 0.55, roc_selected_df),
+        ("prc_auc", "Selected By Val PRC", "#ff7f0e", "--", "s", 0.55, prc_selected_df),
+        ("pareto", "Selected By Val Integral", "#2ca02c", "-.", "^", 0.55, pareto_selected_df),
+    ]
+
+    for eval_time in ("early", "last"):
+        for method in methods:
+            fig = Figure(figsize=(7, 5))
+            ax = fig.subplots()
+            plotted = False
+
+            for strategy_name, label, color, linestyle, marker, alpha, selected_df in strategy_inputs:
+                if selected_df.empty or "method" not in selected_df.columns:
+                    continue
+                use_df = selected_df.loc[selected_df["method"] == method].copy()
+                if use_df.empty:
+                    continue
+                if strategy_name == "pareto":
+                    if "mode" not in use_df.columns:
+                        continue
+                    use_df = use_df.loc[use_df["mode"] == eval_time].copy()
+                    if use_df.empty:
+                        continue
+
+                alpha_values, avg_det_times, bal_accs = _mean_ori_curve_points(use_df, test_logs_by_key, eval_time)
+                if avg_det_times.size == 0 or bal_accs.size == 0:
+                    continue
+
+                plotted = True
+                ax.plot(
+                    avg_det_times,
+                    bal_accs,
+                    linestyle=linestyle,
+                    marker=marker,
+                    linewidth=2.0,
+                    markersize=5,
+                    label=label,
+                    color=color,
+                    alpha=alpha,
+                    markeredgewidth=0.8,
+                    markeredgecolor=color,
+                    markerfacecolor="white",
+                )
+                for alpha, avg_det_time, bal_acc in zip(alpha_values, avg_det_times, bal_accs):
+                    curve_rows.append({
+                        "method": method,
+                        "mode": eval_time,
+                        "selection_strategy": strategy_name,
+                        "alpha": float(alpha),
+                        "avg_det_time": float(avg_det_time),
+                        "bal_acc": float(bal_acc),
+                    })
+
+            if not plotted:
+                continue
+
+            ax.set_xlabel("Average Detection Time")
+            ax.set_ylabel("Balanced Accuracy")
+            ax.set_title(f"{method}: Test Average Detection Time vs Balanced Accuracy ({eval_time})")
+            ax.set_xlim(0.0, 1.0)
+            ax.set_ylim(0.0, 1.0)
+            ax.grid(True, alpha=0.3)
+            ax.legend(fontsize=8, loc="lower right", framealpha=0.9)
+            fig.tight_layout()
+
+            filename = f"{_safe_file_stem(method)}_avg_det_time_vs_bal_acc_{eval_time}.png"
+            path_out = os.path.join(plot_dir, filename)
+            fig.savefig(path_out, dpi=300)
+            outputs[f"{_safe_file_stem(method)}_{eval_time}_selection_curve"] = path_out
 
     if curve_rows:
+        points_path = os.path.join(plot_dir, "selection_curve_points.csv")
         _write_dataframe(
-            pd.DataFrame(curve_rows).sort_values(by=["mode", "method", "bal_acc"]).reset_index(drop=True),
-            os.path.join(save_dir, "avg_det_time_vs_bal_acc_points.csv"),
+            pd.DataFrame(curve_rows).sort_values(by=["method", "mode", "selection_strategy", "alpha"]).reset_index(drop=True),
+            points_path,
         )
+        outputs["selection_curve_points"] = points_path
+
+    return outputs
 
 
 _SELECTION_STRATEGY_SPECS = [
@@ -745,9 +792,13 @@ def _selection_barplot_rows(
     add_rows(prc_best_test_df, "prc_auc", "test_prc_auc", "test_prc_auc_early")
     add_rows(pareto_best_test_df, "pareto", "test_prc_auc", "test_prc_auc_early", mode="early")
 
-    add_rows(roc_best_test_df, "roc_auc", "test_integral_t_at_balacc", "test_integral_t_at_balacc_early")
-    add_rows(prc_best_test_df, "prc_auc", "test_integral_t_at_balacc", "test_integral_t_at_balacc_early")
-    add_rows(pareto_best_test_df, "pareto", "test_integral_t_at_balacc", "test_integral_t_at_balacc", mode="early")
+    add_rows(roc_best_test_df, "roc_auc", "test_integral_t_at_balacc_early", "test_integral_t_at_balacc_early")
+    add_rows(prc_best_test_df, "prc_auc", "test_integral_t_at_balacc_early", "test_integral_t_at_balacc_early")
+    add_rows(pareto_best_test_df, "pareto", "test_integral_t_at_balacc_early", "test_integral_t_at_balacc", mode="early")
+
+    add_rows(roc_best_test_df, "roc_auc", "test_integral_t_at_balacc_last", "test_integral_t_at_balacc_last")
+    add_rows(prc_best_test_df, "prc_auc", "test_integral_t_at_balacc_last", "test_integral_t_at_balacc_last")
+    add_rows(pareto_best_test_df, "pareto", "test_integral_t_at_balacc_last", "test_integral_t_at_balacc", mode="last")
 
     if not rows:
         return pd.DataFrame(columns=["method", "selection_strategy", "metric", "mode", "num_runs", "mean", "std"])
@@ -815,7 +866,8 @@ def save_test_selection_barplots(
     metric_specs = [
         ("test_roc_auc", "Test ROC-AUC By Val Selection", "Test ROC-AUC", False, "test_roc_auc_by_val_selection.png"),
         ("test_prc_auc", "Test PRC-AUC By Val Selection", "Test PRC-AUC", False, "test_prc_auc_by_val_selection.png"),
-        ("test_integral_t_at_balacc", "Test Integral t@bal_acc By Val Selection (early)", "Test Integral t@bal_acc", True, "test_integral_t_at_balacc_early_by_val_selection.png"),
+        ("test_integral_t_at_balacc_early", "Test Integral t@bal_acc By Val Selection (early)", "Test Integral t@bal_acc", True, "test_integral_t_at_balacc_early_by_val_selection.png"),
+        ("test_integral_t_at_balacc_last", "Test Integral t@bal_acc By Val Selection (last)", "Test Integral t@bal_acc", True, "test_integral_t_at_balacc_last_by_val_selection.png"),
     ]
     for metric, title, ylabel, lower_is_better, filename in metric_specs:
         metric_df = summary_df.loc[summary_df["metric"] == metric].copy()
@@ -1183,8 +1235,8 @@ def run_test_pipeline(
     logs_dir: str,
     save_dir: str,
     force_eval: bool = False,
-    min_curve_fraction: float = AUTO_COMMON_BAL_ACC_MIN_CURVE_FRACTION,
-    grid_step: float = AUTO_COMMON_BAL_ACC_GRID_STEP,
+    bal_acc_min: float = PARETO_INTEGRAL_BAL_ACC_MIN,
+    bal_acc_max: float = PARETO_INTEGRAL_BAL_ACC_MAX,
     penalty_det_time: float = PENALIZED_DET_TIME,
 ) -> dict:
     logs_dir = os.path.abspath(logs_dir)
@@ -1202,7 +1254,11 @@ def run_test_pipeline(
     roc_selected_df = _select_ori_best_weights(val_ori_df, roc_best_weights_df)
     prc_selected_df = _select_ori_best_weights(val_ori_df, prc_best_weights_df)
 
-    range_by_group, range_df = build_val_pareto_ranges(candidates, min_curve_fraction=min_curve_fraction, grid_step=grid_step)
+    range_by_group, range_df = build_val_pareto_ranges(
+        candidates,
+        bal_acc_min=bal_acc_min,
+        bal_acc_max=bal_acc_max,
+    )
     val_pareto_df = score_pareto_candidates(
         candidates,
         range_by_group=range_by_group,
@@ -1340,7 +1396,13 @@ def run_test_pipeline(
     _write_dataframe(pareto_test_agg_df, os.path.join(pareto_dir, "test_pareto_aggregate.csv"))
     _write_dataframe(pareto_best_test_df, os.path.join(pareto_dir, "best_test_metrics_by_seed.csv"))
     _remove_test_curve_outputs(pareto_dir)
-    save_selected_test_bal_acc_curves(pareto_dir, available_pareto_selected_df, test_logs_by_key)
+    selection_curve_paths = save_test_selection_curves(
+        save_dir,
+        available_roc_selected_df,
+        available_prc_selected_df,
+        available_pareto_selected_df,
+        test_logs_by_key,
+    )
     selection_plot_paths = save_test_selection_barplots(save_dir, roc_best_test_df, prc_best_test_df, pareto_best_test_df)
     _save_strategy_payload(os.path.join(pareto_dir, "summary.json"), {
         "strategy": "pareto",
@@ -1362,8 +1424,8 @@ def run_test_pipeline(
         "logs_dir": logs_dir,
         "save_dir": save_dir,
         "force_eval": bool(force_eval),
-        "min_curve_fraction": float(min_curve_fraction),
-        "grid_step": float(grid_step),
+        "integral_bal_acc_min": float(bal_acc_min),
+        "integral_bal_acc_max": float(bal_acc_max),
         "penalty_det_time": float(penalty_det_time),
         "num_candidates": int(len(candidates)),
         "num_selected_runs": int(len(selected_pairs)),
@@ -1376,6 +1438,7 @@ def run_test_pipeline(
         "prc_auc_best_test_metrics_by_seed": os.path.join(prc_dir, "best_test_metrics_by_seed.csv"),
         "pareto_summary": os.path.join(pareto_dir, "summary.json"),
         "pareto_best_test_metrics_by_seed": os.path.join(pareto_dir, "best_test_metrics_by_seed.csv"),
+        **selection_curve_paths,
         **selection_plot_paths,
     }
     _save_strategy_payload(os.path.join(save_dir, "test_summary.json"), payload)
@@ -1404,16 +1467,16 @@ def main() -> None:
         help="Re-run test evaluation even if eval/ori_logs.json and eval/new_logs.json already exist.",
     )
     parser.add_argument(
-        "--min-curve-fraction",
+        "--pareto-bal-acc-min",
         type=float,
-        default=AUTO_COMMON_BAL_ACC_MIN_CURVE_FRACTION,
-        help="Minimum fraction of validation Pareto curves that must cover the chosen bal_acc interval.",
+        default=PARETO_INTEGRAL_BAL_ACC_MIN,
+        help="Lower bound of the fixed bal_acc range used for Pareto integration.",
     )
     parser.add_argument(
-        "--grid-step",
+        "--pareto-bal-acc-max",
         type=float,
-        default=AUTO_COMMON_BAL_ACC_GRID_STEP,
-        help="Grid step used when searching validation bal_acc ranges.",
+        default=PARETO_INTEGRAL_BAL_ACC_MAX,
+        help="Upper bound of the fixed bal_acc range used for Pareto integration.",
     )
     parser.add_argument(
         "--penalty-det-time",
@@ -1428,8 +1491,8 @@ def main() -> None:
         logs_dir=args.logs_dir,
         save_dir=save_dir,
         force_eval=args.force_eval,
-        min_curve_fraction=args.min_curve_fraction,
-        grid_step=args.grid_step,
+        bal_acc_min=args.pareto_bal_acc_min,
+        bal_acc_max=args.pareto_bal_acc_max,
         penalty_det_time=args.penalty_det_time,
     )
 

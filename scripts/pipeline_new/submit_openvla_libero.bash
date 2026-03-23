@@ -160,3 +160,30 @@ for SUITE_NAME in 10; do
         train.seed=0-1-2 \
         train.exp_suffix=handcrafted
 done
+
+# Trans baseline / your method
+for SUITE_NAME in 10; do
+    python -m failure_prob.pipeline.train_new \
+        --multirun \
+        train.wandb_group_name=${GROUP_NAME} \
+        train.wandb_dir=${WANDB_DIR}/openvla/trans \
+        train.roc_every=10 \
+        dataset=openvla_libero_${SUITE_NAME} \
+        dataset.data_path_prefix=${SAFE_OPENVLA_ROLLOUT_ROOT} \
+        dataset.use_cache=True \
+        dataset.cache_dir=${CACHE_DIR} \
+        dataset.token_idx_rel=concat-2 \
+        dataset.load_to_cuda=False \
+        model=trans \
+        model.lr=1e-5,1.5e-5 \
+        model.dropout=0.3,0.4 \
+        model.lambda_reg=0.3,0.5 \
+        model.use_time_weighting=True \
+        model.lambda_pairwise_auc=0.01,0.03 \
+        model.pairwise_auc_beta=5.0 \
+        model.use_prefix_pairwise_auc=True \
+        model.lambda_prefix_pairwise_auc=0.01 \
+        model.prefix_pairwise_ratio=0.5 \
+        train.seed=0 \
+        train.exp_suffix=trans
+done
