@@ -804,10 +804,14 @@ def write_val_selection_summaries(
     penalty_det_time: float = PENALIZED_DET_TIME,
 ) -> dict:
     candidates = collect_val_candidates_from_rows(rows)
-    if not candidates:
-        return {}
-
     methods_dir = os.path.join(save_dir, "methods")
+    if not candidates:
+        return {
+            "methods_dir": methods_dir,
+            "methods": [],
+            "method_summaries": {},
+        }
+
     method_payloads = {}
     for method_name in sorted({candidate["method"] for candidate in candidates}):
         method_candidates = [candidate for candidate in candidates if candidate["method"] == method_name]
@@ -833,13 +837,46 @@ def write_val_selection_summaries(
         _save_payload(os.path.join(method_dir, "val_summary.json"), method_payload)
         method_payloads[method_name] = method_payload
 
-    payload = {
+    return {
         "methods_dir": methods_dir,
         "methods": sorted(method_payloads),
         "method_summaries": method_payloads,
     }
-    _save_payload(os.path.join(save_dir, "methods_summary.json"), payload)
-    return payload
+
+
+def _write_method_batch_sidecars(
+    save_dir: str,
+    failures: list[dict],
+    skipped_runs: list[dict],
+) -> None:
+    methods_dir = os.path.join(save_dir, "methods")
+    grouped_failures: dict[str, list[dict]] = {}
+    grouped_skipped: dict[str, list[dict]] = {}
+
+    def _append(grouped: dict[str, list[dict]], row: dict) -> None:
+        method_name = str(row.get("method") or "_unknown")
+        grouped.setdefault(method_name, []).append(row)
+
+    for row in failures:
+        _append(grouped_failures, row)
+    for row in skipped_runs:
+        _append(grouped_skipped, row)
+
+    for method_name in sorted(set(grouped_failures) | set(grouped_skipped)):
+        method_dir = os.path.join(methods_dir, method_name)
+        os.makedirs(method_dir, exist_ok=True)
+
+        method_failures = grouped_failures.get(method_name, [])
+        if method_failures:
+            _write_dataframe(
+                pd.DataFrame([{k: v for k, v in row.items() if k != "traceback"} for row in method_failures]),
+                os.path.join(method_dir, "val_failures.csv"),
+            )
+            _save_payload(os.path.join(method_dir, "val_failures.json"), method_failures)
+
+        method_skipped = grouped_skipped.get(method_name, [])
+        if method_skipped:
+            _write_dataframe(pd.DataFrame(method_skipped), os.path.join(method_dir, "val_skipped.csv"))
 
 
 def _normalize_method_filters(method_filter: str | None) -> set[str] | None:
@@ -941,6 +978,7 @@ def run_batch_validation(logs_dir: str, save_dir: str, method_filter: str | None
     skipped_runs = []
     for log_dir in collect_eval_dirs(Path(logs_dir)):
         log_dir_str = str(log_dir)
+        method_name = None
         try:
             method_name = _load_run_method_name(log_dir_str)
             if method_filters is not None and method_name not in method_filters:
@@ -956,6 +994,7 @@ def run_batch_validation(logs_dir: str, save_dir: str, method_filter: str | None
             failure = {
                 "run_name": os.path.relpath(log_dir_str, logs_dir),
                 "run_dir": os.path.abspath(log_dir_str),
+                "method": method_name,
                 "error_type": type(exc).__name__,
                 "error": str(exc),
                 "traceback": traceback.format_exc(),
@@ -963,35 +1002,23 @@ def run_batch_validation(logs_dir: str, save_dir: str, method_filter: str | None
             failures.append(failure)
             print(f"[val_new] Failed evaluating {failure['run_dir']}: {failure['error']}")
 
-    pd.DataFrame(rows).to_csv(os.path.join(save_dir, "val_summary.csv"), index=False)
-    if failures:
-        pd.DataFrame([{k: v for k, v in failure.items() if k != "traceback"} for failure in failures]).to_csv(
-            os.path.join(save_dir, "val_failures.csv"), index=False
-        )
-        with open(os.path.join(save_dir, "val_failures.json"), "w") as f:
-            json.dump(failures, f, indent=2)
-
-    if skipped_runs:
-        pd.DataFrame(skipped_runs).to_csv(os.path.join(save_dir, "val_skipped.csv"), index=False)
-
     selection_payload = write_val_selection_summaries(rows, save_dir)
-    payload = {
+    _write_method_batch_sidecars(save_dir, failures, skipped_runs)
+    return {
         "logs_dir": logs_dir,
         "save_dir": save_dir,
+        "methods_dir": selection_payload.get("methods_dir", os.path.join(save_dir, "methods")),
         "method_filter": sorted(method_filters) if method_filters is not None else None,
         "num_runs": len(rows),
         "num_failures": len(failures),
         "num_skipped": len(skipped_runs),
         **selection_payload,
     }
-    with open(os.path.join(save_dir, "val_summary.json"), "w") as f:
-        json.dump(payload, f, indent=2)
-    return payload
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Run train/validation-only metrics for trained checkpoints and save ori/new validation logs.",
+        description="Run train/validation-only metrics for trained checkpoints and save per-run val logs plus per-method summaries.",
     )
     parser.add_argument(
         "--logs-dir",
@@ -1001,7 +1028,7 @@ def main() -> None:
     parser.add_argument(
         "--save-dir",
         default=None,
-        help="Directory to save batch validation summaries. Defaults to <logs-dir>/pipeline_val_new.",
+        help="Directory to save per-method validation outputs. Defaults to <logs-dir>/pipeline_val_new.",
     )
     parser.add_argument(
         "--method",
@@ -1012,7 +1039,7 @@ def main() -> None:
 
     save_dir = args.save_dir or os.path.join(os.path.abspath(args.logs_dir), "pipeline_val_new")
     result = run_batch_validation(args.logs_dir, save_dir, method_filter=args.method)
-    print("Saved validation summary to", os.path.abspath(os.path.join(save_dir, "val_summary.json")))
+    print("Saved per-method validation outputs under", os.path.abspath(result["methods_dir"]))
     print(f"runs={result['num_runs']}")
 
 

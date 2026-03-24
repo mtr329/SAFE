@@ -4,7 +4,7 @@ set -euo pipefail
 
 # Run train/validation-only metric computation for trained checkpoints.
 # This writes val/ori_logs.json and val/new_logs.json under each run directory,
-# plus a batch summary under the chosen save_dir.
+# plus per-method summaries under <save_dir>/methods/.
 #
 # Usage:
 #   scripts/pipeline_new/val_new.sh

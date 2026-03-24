@@ -191,4 +191,4 @@ python -m failure_prob.pipeline.train_new \
     model.lambda_prefix_pairwise_auc=0.03 \
     model.prefix_pairwise_ratio=0.4 \
     train.seed=0-1-2 \
-    train.exp_suffix=trans_current_step
+    train.exp_suffix=trans
