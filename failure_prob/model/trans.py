@@ -51,6 +51,16 @@ class TransModel(BaseModel):
         self.use_prefix_pairwise_auc = cfg.model.use_prefix_pairwise_auc
         self.lambda_prefix_pairwise_auc = cfg.model.lambda_prefix_pairwise_auc
         self.prefix_pairwise_ratio = cfg.model.prefix_pairwise_ratio
+        self.prefix_pairwise_ratios = self._resolve_prefix_ratios(
+            getattr(cfg.model, "prefix_pairwise_ratios", None),
+            fallback_ratio=self.prefix_pairwise_ratio,
+        )
+        self.lambda_prefix_monitor = cfg.model.lambda_prefix_monitor
+        self.prefix_monitor_ratio = cfg.model.prefix_monitor_ratio
+        self.prefix_monitor_ratios = self._resolve_prefix_ratios(
+            getattr(cfg.model, "prefix_monitor_ratios", None),
+            fallback_ratio=self.prefix_monitor_ratio,
+        )
         self.use_class_conditional_time_weights = cfg.model.use_class_conditional_time_weights
         self.use_soft_detection_loss = cfg.model.use_soft_detection_loss
         self.lambda_soft_detection = cfg.model.lambda_soft_detection
@@ -64,8 +74,38 @@ class TransModel(BaseModel):
             self.time_gate_tau = nn.Parameter(torch.logit(torch.tensor(init_tau)))
         else:
             self.time_gate_tau = None
+
+        self.aux_warmup_epochs = max(int(cfg.model.aux_warmup_epochs), 0)
+        self.aux_ramp_epochs = max(int(cfg.model.aux_ramp_epochs), 0)
+        self._train_epoch_idx = 0
         
         self._scale_weights(self.cfg.model.init_weight_scale)
+
+
+    def _resolve_prefix_ratios(
+        self,
+        ratios: list[float] | tuple[float, ...] | None,
+        fallback_ratio: float,
+    ) -> list[float]:
+        if ratios is None:
+            ratios = []
+
+        resolved = []
+        for ratio in list(ratios):
+            ratio = float(ratio)
+            if not (0.0 < ratio <= 1.0):
+                raise ValueError(f"prefix ratio must be in (0, 1], got {ratio}")
+            if any(math.isclose(ratio, existing) for existing in resolved):
+                continue
+            resolved.append(ratio)
+
+        if not resolved:
+            fallback_ratio = float(fallback_ratio)
+            if not (0.0 < fallback_ratio <= 1.0):
+                raise ValueError(f"prefix ratio must be in (0, 1], got {fallback_ratio}")
+            resolved.append(fallback_ratio)
+
+        return resolved
 
 
     def _positional_encoding(self, length: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
@@ -167,21 +207,46 @@ class TransModel(BaseModel):
         return torch.nn.functional.softplus(-diff).mean()
 
 
-    def _build_prefix_valid_masks(self, valid_masks: torch.Tensor) -> torch.Tensor:
+    def _build_prefix_valid_masks(
+        self,
+        valid_masks: torch.Tensor,
+        ratio: float | None = None,
+    ) -> torch.Tensor:
         # Build a prefix-only valid mask per sequence to approximate early-window optimization.
-        if not (0.0 < float(self.prefix_pairwise_ratio) <= 1.0):
+        ratio = float(self.prefix_pairwise_ratio if ratio is None else ratio)
+        if not (0.0 < ratio <= 1.0):
             raise ValueError(
-                f"prefix_pairwise_ratio must be in (0, 1], got {self.prefix_pairwise_ratio}"
+                f"prefix ratio must be in (0, 1], got {ratio}"
             )
 
         B, T = valid_masks.shape
         seq_lengths = valid_masks.sum(dim=1).long().clamp(min=1, max=T)  # (B,)
-        prefix_lengths = torch.ceil(seq_lengths.float() * float(self.prefix_pairwise_ratio)).long()
+        prefix_lengths = torch.ceil(seq_lengths.float() * ratio).long()
         prefix_lengths = prefix_lengths.clamp(min=1, max=T)  # (B,)
 
         t_idx = torch.arange(T, device=valid_masks.device).unsqueeze(0).expand(B, -1)  # (B, T)
         prefix_masks = (t_idx < prefix_lengths.unsqueeze(1)).to(valid_masks.dtype)  # (B, T)
         return prefix_masks * valid_masks
+
+
+    def _get_aux_loss_scale(self) -> float:
+        epoch_idx = max(int(self._train_epoch_idx), 0)
+        if epoch_idx <= self.aux_warmup_epochs:
+            return 0.0
+        if self.aux_ramp_epochs == 0:
+            return 1.0
+
+        progress = (epoch_idx - self.aux_warmup_epochs) / float(self.aux_ramp_epochs)
+        return float(min(max(progress, 0.0), 1.0))
+
+
+    def train_epoch(
+        self,
+        optimizer: torch.optim.Optimizer,
+        dataloader,
+    ) -> float:
+        self._train_epoch_idx += 1
+        return super().train_epoch(optimizer, dataloader)
 
 
     def _build_time_weights(
@@ -314,6 +379,23 @@ class TransModel(BaseModel):
             losses, valid_masks, success_labels, weights,
             self.cfg.model.one_loss_per_seq,
         )
+        aux_loss_scale = self._get_aux_loss_scale()
+
+        prefix_monitor_loss = torch.tensor(0.0).to(scores)
+        if self.lambda_prefix_monitor > 0:
+            prefix_monitor_losses = []
+            for ratio in self.prefix_monitor_ratios:
+                prefix_valid_masks = self._build_prefix_valid_masks(valid_masks, ratio=ratio)
+                ratio_loss, _, _ = aggregate_monitor_loss(
+                    losses,
+                    prefix_valid_masks,
+                    success_labels,
+                    weights,
+                    self.cfg.model.one_loss_per_seq,
+                )
+                prefix_monitor_losses.append(ratio_loss)
+            prefix_monitor_loss = torch.stack(prefix_monitor_losses).mean()
+            prefix_monitor_loss = aux_loss_scale * self.lambda_prefix_monitor * prefix_monitor_loss
 
         # Now that we want to do classification based on the max scores before termination
         # Therefore add hard nagative mining loss
@@ -333,28 +415,32 @@ class TransModel(BaseModel):
         pairwise_auc_loss = torch.tensor(0.0).to(scores)
         if self.use_pairwise_auc and self.lambda_pairwise_auc > 0:
             pairwise_auc_loss = self._pairwise_auc_loss(scores, failure_labels, valid_masks)
-            pairwise_auc_loss = self.lambda_pairwise_auc * pairwise_auc_loss
+            pairwise_auc_loss = aux_loss_scale * self.lambda_pairwise_auc * pairwise_auc_loss
 
         prefix_pairwise_auc_loss = torch.tensor(0.0).to(scores)
         if self.use_prefix_pairwise_auc and self.lambda_prefix_pairwise_auc > 0:
-            prefix_valid_masks = self._build_prefix_valid_masks(valid_masks)
-            prefix_pairwise_auc_loss = self._pairwise_auc_loss(
-                scores, failure_labels, prefix_valid_masks
-            )
-            prefix_pairwise_auc_loss = self.lambda_prefix_pairwise_auc * prefix_pairwise_auc_loss
+            prefix_pairwise_losses = []
+            for ratio in self.prefix_pairwise_ratios:
+                prefix_valid_masks = self._build_prefix_valid_masks(valid_masks, ratio=ratio)
+                ratio_loss = self._pairwise_auc_loss(scores, failure_labels, prefix_valid_masks)
+                prefix_pairwise_losses.append(ratio_loss)
+            prefix_pairwise_auc_loss = torch.stack(prefix_pairwise_losses).mean()
+            prefix_pairwise_auc_loss = aux_loss_scale * self.lambda_prefix_pairwise_auc * prefix_pairwise_auc_loss
 
         soft_detection_loss = torch.tensor(0.0).to(scores)
         if self.use_soft_detection_loss and self.lambda_soft_detection > 0:
             soft_detection_loss = self._soft_detection_loss(scores, failure_labels, valid_masks)
-            soft_detection_loss = self.lambda_soft_detection * soft_detection_loss
+            soft_detection_loss = aux_loss_scale * self.lambda_soft_detection * soft_detection_loss
 
-        monitor_loss += hard_neg_loss + pairwise_auc_loss + prefix_pairwise_auc_loss + soft_detection_loss
+        monitor_loss += prefix_monitor_loss + hard_neg_loss + pairwise_auc_loss + prefix_pairwise_auc_loss + soft_detection_loss
 
         # Log the losses
         logs = {
             "monitor_loss": monitor_loss.item(),
             "success_loss": success_loss.item(),
             "fail_loss": fail_loss.item(),
+            "aux_loss_scale": float(aux_loss_scale),
+            "prefix_monitor_loss": prefix_monitor_loss.item(),
             "hard_neg_loss": hard_neg_loss.item(),
             "pairwise_auc_loss": pairwise_auc_loss.item(),
             "prefix_pairwise_auc_loss": prefix_pairwise_auc_loss.item(),

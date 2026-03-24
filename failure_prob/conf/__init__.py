@@ -220,11 +220,17 @@ class TransModelConfig(ModelConfig):
     use_prefix_pairwise_auc: bool = True
     lambda_prefix_pairwise_auc: float = 0.03
     prefix_pairwise_ratio: float = 0.2
+    prefix_pairwise_ratios: list[float] = field(default_factory=lambda: [0.2, 0.4])
+    lambda_prefix_monitor: float = 0.05
+    prefix_monitor_ratio: float = 0.4
+    prefix_monitor_ratios: list[float] = field(default_factory=lambda: [0.2, 0.4])
     use_class_conditional_time_weights: bool = True
     use_soft_detection_loss: bool = True
     lambda_soft_detection: float = 0.1
     soft_detection_threshold: float = 0.5
     soft_detection_temperature: float = 0.05
+    aux_warmup_epochs: int = 20
+    aux_ramp_epochs: int = 60
     dropout: float = 0.2
 
     lr: float = 1e-4

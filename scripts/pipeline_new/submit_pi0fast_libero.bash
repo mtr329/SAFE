@@ -160,10 +160,8 @@ CACHE_DIR=./dataset_cache
 #     train.exp_suffix=handcrafted
 
 # Trans
-# Focused rerun after fixing the causal history window.
-# Keep this small enough to answer two questions first:
-# 1) does including the current timestep help?
-# 2) is pre_logits a better representation for early detection?
+# Focused second-round sweep: keep middle-history settings and soften the early losses.
+# This gives 12 settings per seed while testing whether ROC/PRC can recover without losing the integral gains.
 python -m failure_prob.pipeline.train_new \
     --multirun \
     train.wandb_group_name=${GROUP_NAME} \
@@ -179,16 +177,21 @@ python -m failure_prob.pipeline.train_new \
     model.lr=1e-4 \
     model.dropout=0.2 \
     model.lambda_reg=0.1 \
+    model.cumsum=True \
     model.use_time_weighting=True \
     model.use_class_conditional_time_weights=True \
     model.use_soft_detection_loss=True \
-    model.lambda_soft_detection=0.03 \
+    model.lambda_soft_detection=0.08,0.10,0.12 \
     model.soft_detection_temperature=0.05 \
-    model.n_history_steps=1,16 \
-    model.lambda_pairwise_auc=0.0 \
+    model.n_history_steps=4,8 \
+    model.aux_warmup_epochs=5 \
+    model.aux_ramp_epochs=30 \
+    model.lambda_pairwise_auc=0.03 \
     model.pairwise_auc_beta=5.0 \
     model.use_prefix_pairwise_auc=True \
     model.lambda_prefix_pairwise_auc=0.03 \
-    model.prefix_pairwise_ratio=0.4 \
+    model.prefix_pairwise_ratios='[0.2,0.4]' \
+    model.lambda_prefix_monitor=0.03,0.05 \
+    model.prefix_monitor_ratios='[0.2,0.4]' \
     train.seed=0-1-2 \
     train.exp_suffix=trans
