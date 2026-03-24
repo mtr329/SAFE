@@ -160,6 +160,10 @@ CACHE_DIR=./dataset_cache
 #     train.exp_suffix=handcrafted
 
 # Trans
+# Focused rerun after fixing the causal history window.
+# Keep this small enough to answer two questions first:
+# 1) does including the current timestep help?
+# 2) is pre_logits a better representation for early detection?
 python -m failure_prob.pipeline.train_new \
     --multirun \
     train.wandb_group_name=${GROUP_NAME} \
@@ -168,7 +172,7 @@ python -m failure_prob.pipeline.train_new \
     dataset.data_path_prefix=${SAFE_OPENPI_ROLLOUT_ROOT} \
     dataset.use_cache=True \
     dataset.cache_dir=${CACHE_DIR} \
-    dataset.feat_name=encoded \
+    dataset.feat_name=pre_logits \
     dataset.token_idx_rel=mean \
     model=trans \
     train.roc_every=10 \
@@ -176,10 +180,15 @@ python -m failure_prob.pipeline.train_new \
     model.dropout=0.2 \
     model.lambda_reg=0.1 \
     model.use_time_weighting=True \
-    model.lambda_pairwise_auc=0.0,0.1 \
+    model.use_class_conditional_time_weights=True \
+    model.use_soft_detection_loss=True \
+    model.lambda_soft_detection=0.03 \
+    model.soft_detection_temperature=0.05 \
+    model.n_history_steps=1,16 \
+    model.lambda_pairwise_auc=0.0 \
     model.pairwise_auc_beta=5.0 \
-    model.use_prefix_pairwise_auc=False,True \
-    model.lambda_prefix_pairwise_auc=0.01,0.1 \
+    model.use_prefix_pairwise_auc=True \
+    model.lambda_prefix_pairwise_auc=0.03 \
     model.prefix_pairwise_ratio=0.4 \
     train.seed=0-1-2 \
-    train.exp_suffix=trans
+    train.exp_suffix=trans_current_step

@@ -10,6 +10,7 @@ set -euo pipefail
 #   scripts/pipeline_new/val_new.sh
 #   scripts/pipeline_new/val_new.sh --logs-dir log_ckpt_new/pizero_fast
 #   scripts/pipeline_new/val_new.sh --gpu 0 --logs-dir log_ckpt_new/pizero_fast --save-dir /tmp/val_new
+#   scripts/pipeline_new/val_new.sh --logs-dir log_ckpt_new/pizero_fast --method trans
 
 resolve_default_logs_dir() {
     if [ -n "${PIPELINE_NEW_LOGS_DIR:-}" ]; then
@@ -31,6 +32,7 @@ resolve_default_logs_dir() {
 gpu_id="${CUDA_VISIBLE_DEVICES:-}"
 logs_dir=""
 save_dir=""
+method_name=""
 
 while [ "$#" -gt 0 ]; do
     case "$1" in
@@ -56,6 +58,14 @@ while [ "$#" -gt 0 ]; do
                 exit 1
             fi
             save_dir="$2"
+            shift 2
+            ;;
+        --method)
+            if [ "$#" -lt 2 ]; then
+                echo "Missing value for --method" >&2
+                exit 1
+            fi
+            method_name="$2"
             shift 2
             ;;
         -h|--help)
@@ -99,6 +109,10 @@ cmd=(
     --logs-dir "${logs_dir}"
     --save-dir "${save_dir}"
 )
+
+if [ -n "${method_name}" ]; then
+    cmd+=(--method "${method_name}")
+fi
 
 printf 'Running:'
 if [ -n "${gpu_id}" ]; then

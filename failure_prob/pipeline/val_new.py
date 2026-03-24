@@ -721,8 +721,8 @@ def summarize_mean_val_pareto(
     return range_df, by_seed_df, by_weight_df, best_df
 
 
-def write_val_selection_summaries(
-    rows: list[dict],
+def _write_selection_bundle(
+    candidates: list[dict],
     save_dir: str,
     early_bal_acc_min: float = PARETO_INTEGRAL_EARLY_BAL_ACC_MIN,
     early_bal_acc_max: float = PARETO_INTEGRAL_EARLY_BAL_ACC_MAX,
@@ -730,7 +730,6 @@ def write_val_selection_summaries(
     last_bal_acc_max: float = PARETO_INTEGRAL_LAST_BAL_ACC_MAX,
     penalty_det_time: float = PENALIZED_DET_TIME,
 ) -> dict:
-    candidates = collect_val_candidates_from_rows(rows)
     if not candidates:
         return {}
 
@@ -793,6 +792,66 @@ def write_val_selection_summaries(
         "pareto_summary": os.path.join(pareto_dir, "summary.json"),
         "pareto_best_weights": os.path.join(pareto_dir, "best_weights.csv"),
     }
+
+
+def write_val_selection_summaries(
+    rows: list[dict],
+    save_dir: str,
+    early_bal_acc_min: float = PARETO_INTEGRAL_EARLY_BAL_ACC_MIN,
+    early_bal_acc_max: float = PARETO_INTEGRAL_EARLY_BAL_ACC_MAX,
+    last_bal_acc_min: float = PARETO_INTEGRAL_LAST_BAL_ACC_MIN,
+    last_bal_acc_max: float = PARETO_INTEGRAL_LAST_BAL_ACC_MAX,
+    penalty_det_time: float = PENALIZED_DET_TIME,
+) -> dict:
+    candidates = collect_val_candidates_from_rows(rows)
+    if not candidates:
+        return {}
+
+    methods_dir = os.path.join(save_dir, "methods")
+    method_payloads = {}
+    for method_name in sorted({candidate["method"] for candidate in candidates}):
+        method_candidates = [candidate for candidate in candidates if candidate["method"] == method_name]
+        method_rows = [row for row in rows if str(row.get("method")) == method_name]
+        method_dir = os.path.join(methods_dir, method_name)
+        os.makedirs(method_dir, exist_ok=True)
+        _write_dataframe(pd.DataFrame(method_rows), os.path.join(method_dir, "val_summary.csv"))
+        bundle_payload = _write_selection_bundle(
+            method_candidates,
+            method_dir,
+            early_bal_acc_min=early_bal_acc_min,
+            early_bal_acc_max=early_bal_acc_max,
+            last_bal_acc_min=last_bal_acc_min,
+            last_bal_acc_max=last_bal_acc_max,
+            penalty_det_time=penalty_det_time,
+        )
+        method_payload = {
+            "method": method_name,
+            "save_dir": method_dir,
+            "num_runs": int(len(method_rows)),
+            **bundle_payload,
+        }
+        _save_payload(os.path.join(method_dir, "val_summary.json"), method_payload)
+        method_payloads[method_name] = method_payload
+
+    payload = {
+        "methods_dir": methods_dir,
+        "methods": sorted(method_payloads),
+        "method_summaries": method_payloads,
+    }
+    _save_payload(os.path.join(save_dir, "methods_summary.json"), payload)
+    return payload
+
+
+def _normalize_method_filters(method_filter: str | None) -> set[str] | None:
+    if method_filter is None:
+        return None
+    values = {part.strip() for part in str(method_filter).split(",") if part.strip()}
+    return values or None
+
+
+def _load_run_method_name(log_dir: str) -> str:
+    cfg = OmegaConf.load(os.path.join(log_dir, "config.yaml"))
+    return _method_name(cfg)
 
 
 def evaluate_run(log_dir: str, logs_dir: str) -> dict:
@@ -871,20 +930,32 @@ def evaluate_run(log_dir: str, logs_dir: str) -> dict:
     }
 
 
-def run_batch_validation(logs_dir: str, save_dir: str) -> dict:
+def run_batch_validation(logs_dir: str, save_dir: str, method_filter: str | None = None) -> dict:
     logs_dir = os.path.abspath(logs_dir)
     save_dir = os.path.abspath(save_dir)
     os.makedirs(save_dir, exist_ok=True)
 
+    method_filters = _normalize_method_filters(method_filter)
     rows = []
     failures = []
+    skipped_runs = []
     for log_dir in collect_eval_dirs(Path(logs_dir)):
+        log_dir_str = str(log_dir)
         try:
-            rows.append(evaluate_run(str(log_dir), logs_dir))
+            method_name = _load_run_method_name(log_dir_str)
+            if method_filters is not None and method_name not in method_filters:
+                skipped_runs.append({
+                    "run_name": os.path.relpath(log_dir_str, logs_dir),
+                    "run_dir": os.path.abspath(log_dir_str),
+                    "method": method_name,
+                    "skip_reason": "method_filter",
+                })
+                continue
+            rows.append(evaluate_run(log_dir_str, logs_dir))
         except Exception as exc:
             failure = {
-                "run_name": os.path.relpath(str(log_dir), logs_dir),
-                "run_dir": os.path.abspath(str(log_dir)),
+                "run_name": os.path.relpath(log_dir_str, logs_dir),
+                "run_dir": os.path.abspath(log_dir_str),
                 "error_type": type(exc).__name__,
                 "error": str(exc),
                 "traceback": traceback.format_exc(),
@@ -900,12 +971,17 @@ def run_batch_validation(logs_dir: str, save_dir: str) -> dict:
         with open(os.path.join(save_dir, "val_failures.json"), "w") as f:
             json.dump(failures, f, indent=2)
 
+    if skipped_runs:
+        pd.DataFrame(skipped_runs).to_csv(os.path.join(save_dir, "val_skipped.csv"), index=False)
+
     selection_payload = write_val_selection_summaries(rows, save_dir)
     payload = {
         "logs_dir": logs_dir,
         "save_dir": save_dir,
+        "method_filter": sorted(method_filters) if method_filters is not None else None,
         "num_runs": len(rows),
         "num_failures": len(failures),
+        "num_skipped": len(skipped_runs),
         **selection_payload,
     }
     with open(os.path.join(save_dir, "val_summary.json"), "w") as f:
@@ -927,10 +1003,15 @@ def main() -> None:
         default=None,
         help="Directory to save batch validation summaries. Defaults to <logs-dir>/pipeline_val_new.",
     )
+    parser.add_argument(
+        "--method",
+        default=None,
+        help="Optional method name filter. Use exact method names such as 'trans' or 'embed_cosine'. Multiple values can be comma-separated.",
+    )
     args = parser.parse_args()
 
     save_dir = args.save_dir or os.path.join(os.path.abspath(args.logs_dir), "pipeline_val_new")
-    result = run_batch_validation(args.logs_dir, save_dir)
+    result = run_batch_validation(args.logs_dir, save_dir, method_filter=args.method)
     print("Saved validation summary to", os.path.abspath(os.path.join(save_dir, "val_summary.json")))
     print(f"runs={result['num_runs']}")
 

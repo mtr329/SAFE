@@ -2,6 +2,7 @@ import math
 import pdb
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from .base import BaseModel
 from .utils import get_time_weight, aggregate_monitor_loss, hard_negative_loss, cumsum_stopgrad
@@ -50,6 +51,11 @@ class TransModel(BaseModel):
         self.use_prefix_pairwise_auc = cfg.model.use_prefix_pairwise_auc
         self.lambda_prefix_pairwise_auc = cfg.model.lambda_prefix_pairwise_auc
         self.prefix_pairwise_ratio = cfg.model.prefix_pairwise_ratio
+        self.use_class_conditional_time_weights = cfg.model.use_class_conditional_time_weights
+        self.use_soft_detection_loss = cfg.model.use_soft_detection_loss
+        self.lambda_soft_detection = cfg.model.lambda_soft_detection
+        self.soft_detection_threshold = cfg.model.soft_detection_threshold
+        self.soft_detection_temperature = cfg.model.soft_detection_temperature
         if self.use_time_gate:
             # Learnable gate center in normalized time (0..1)
             eps = 1e-4
@@ -98,8 +104,9 @@ class TransModel(BaseModel):
             x_proj = self.dropout(x_proj)
             out = self.encoder(x_proj, mask=self._causal_mask(T, x.device))  # (B, T, hidden_dim)
         else:
-            # Prepare sliding windows: for each timestep t, extract [t-n, ..., t-1]
-            x_padded = torch.nn.functional.pad(x, (0, 0, n, 0), mode="constant", value=0)  # (B, T+n, D)
+            # For each timestep t, use the most recent n steps including the current one.
+            pad_steps = max(n - 1, 0)
+            x_padded = torch.nn.functional.pad(x, (0, 0, pad_steps, 0), mode="constant", value=0)
 
             x_windows = []
             for t in range(T):
@@ -177,6 +184,65 @@ class TransModel(BaseModel):
         return prefix_masks * valid_masks
 
 
+    def _build_time_weights(
+        self,
+        valid_masks: torch.Tensor,
+        success_labels: torch.Tensor,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        failure_time_weights = get_time_weight(self.cfg.model.use_time_weighting, valid_masks).to(dtype=dtype)
+        if not self.use_class_conditional_time_weights:
+            return failure_time_weights
+
+        # Keep success weighting uniform so the model is not pushed to suppress all early scores.
+        success_time_weights = valid_masks.to(dtype=dtype)
+        return torch.where(success_labels[:, None] > 0.5, success_time_weights, failure_time_weights)
+
+
+    def _soft_detection_loss(
+        self,
+        scores: torch.Tensor,
+        failure_labels: torch.Tensor,
+        valid_masks: torch.Tensor,
+    ) -> torch.Tensor:
+        if scores.numel() == 0:
+            return scores.new_tensor(0.0)
+
+        eps = 1e-6
+        threshold = float(self.soft_detection_threshold)
+        temperature = max(float(self.soft_detection_temperature), eps)
+        valid_masks = valid_masks.to(scores)
+
+        detect_probs = torch.sigmoid((scores - threshold) / temperature) * valid_masks
+        detect_probs = detect_probs.clamp(min=0.0, max=1.0 - eps)
+
+        B, T = detect_probs.shape
+        seq_lengths = valid_masks.sum(dim=1).clamp(min=1.0)
+        denom = torch.clamp(seq_lengths - 1.0, min=1.0)
+        t_idx = torch.arange(T, device=scores.device, dtype=scores.dtype).unsqueeze(0).expand(B, -1)
+        t_norm = torch.minimum(t_idx / denom.unsqueeze(1), torch.ones_like(t_idx))
+
+        log_survival = torch.cumsum(torch.log(torch.clamp(1.0 - detect_probs, min=eps)), dim=1)
+        prev_log_survival = F.pad(log_survival[:, :-1], (1, 0), value=0.0)
+        prev_survival = torch.exp(prev_log_survival)
+        hit_mass = prev_survival * detect_probs
+        final_survival = torch.exp(log_survival[:, -1])
+
+        expected_det_time = (hit_mass * t_norm).sum(dim=1) + final_survival
+        success_alarm = detect_probs.max(dim=1).values
+
+        loss_terms = []
+        pos_mask = failure_labels > 0.5
+        neg_mask = ~pos_mask
+        if pos_mask.any():
+            loss_terms.append(expected_det_time[pos_mask].mean())
+        if neg_mask.any():
+            loss_terms.append(success_alarm[neg_mask].mean())
+        if not loss_terms:
+            return scores.new_tensor(0.0)
+        return torch.stack(loss_terms).mean()
+
+
     def forward_compute_loss(
         self, 
         batch: dict[str, torch.Tensor],
@@ -198,8 +264,7 @@ class TransModel(BaseModel):
         scores = scores.squeeze(-1)  # (B, T)
         
         # Design the weights based on time
-        time_weights = get_time_weight(self.cfg.model.use_time_weighting, valid_masks)  # (B, T)
-        time_weights = time_weights.to(scores) # (B, T)
+        time_weights = self._build_time_weights(valid_masks, success_labels, scores.dtype).to(scores)
         
         if self.use_time_gate:
             # Build a learnable time gate g(t) in [0,1] to control when class separation increases.
@@ -277,8 +342,13 @@ class TransModel(BaseModel):
                 scores, failure_labels, prefix_valid_masks
             )
             prefix_pairwise_auc_loss = self.lambda_prefix_pairwise_auc * prefix_pairwise_auc_loss
-        
-        monitor_loss += hard_neg_loss + pairwise_auc_loss + prefix_pairwise_auc_loss
+
+        soft_detection_loss = torch.tensor(0.0).to(scores)
+        if self.use_soft_detection_loss and self.lambda_soft_detection > 0:
+            soft_detection_loss = self._soft_detection_loss(scores, failure_labels, valid_masks)
+            soft_detection_loss = self.lambda_soft_detection * soft_detection_loss
+
+        monitor_loss += hard_neg_loss + pairwise_auc_loss + prefix_pairwise_auc_loss + soft_detection_loss
 
         # Log the losses
         logs = {
@@ -288,6 +358,7 @@ class TransModel(BaseModel):
             "hard_neg_loss": hard_neg_loss.item(),
             "pairwise_auc_loss": pairwise_auc_loss.item(),
             "prefix_pairwise_auc_loss": prefix_pairwise_auc_loss.item(),
+            "soft_detection_loss": soft_detection_loss.item(),
         }
         
         return monitor_loss, logs

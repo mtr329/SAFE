@@ -73,35 +73,105 @@ def _resolve_val_summary_dir(logs_dir: str) -> str:
 
 
 
-def _ensure_val_best_weight_outputs(logs_dir: str) -> dict[str, str]:
-    val_dir = _resolve_val_summary_dir(logs_dir)
-    val_summary_path = os.path.join(val_dir, "val_summary.csv")
-    if not os.path.isfile(val_summary_path):
-        raise FileNotFoundError(
-            f"Missing validation summary: {val_summary_path}. Run failure_prob/pipeline/val_new.py first."
-        )
+def _resolve_val_methods_dir(logs_dir: str) -> str:
+    return os.path.join(_resolve_val_summary_dir(logs_dir), "methods")
 
-    expected = {
+
+
+def _legacy_best_weight_paths(val_dir: str) -> dict[str, str]:
+    return {
         "roc_auc": os.path.join(val_dir, "roc_auc", "best_weights.csv"),
         "prc_auc": os.path.join(val_dir, "prc_auc", "best_weights.csv"),
         "pareto": os.path.join(val_dir, "pareto", "best_weights.csv"),
     }
-    if all(os.path.isfile(path) for path in expected.values()):
-        return expected
-
-    rows = pd.read_csv(val_summary_path).to_dict(orient="records")
-    write_val_selection_summaries(rows, val_dir)
-    missing = [path for path in expected.values() if not os.path.isfile(path)]
-    if missing:
-        raise FileNotFoundError(f"Missing val best-weight outputs after rebuild: {missing}")
-    return expected
 
 
 
-def _load_best_weights_df(path: str) -> pd.DataFrame:
-    if not os.path.isfile(path):
-        raise FileNotFoundError(f"Missing best-weight file: {path}")
-    return pd.read_csv(path)
+def _method_best_weight_paths(method_dir: str) -> dict[str, str]:
+    return {
+        "roc_auc": os.path.join(method_dir, "roc_auc", "best_weights.csv"),
+        "prc_auc": os.path.join(method_dir, "prc_auc", "best_weights.csv"),
+        "pareto": os.path.join(method_dir, "pareto", "best_weights.csv"),
+    }
+
+
+
+def _collect_per_method_best_weight_paths(val_dir: str) -> dict[str, list[str]]:
+    methods_dir = os.path.join(val_dir, "methods")
+    collected = {"roc_auc": [], "prc_auc": [], "pareto": []}
+    if not os.path.isdir(methods_dir):
+        return collected
+
+    root_val_summary_path = os.path.join(val_dir, "val_summary.csv")
+    root_val_df = pd.read_csv(root_val_summary_path) if os.path.isfile(root_val_summary_path) else None
+    for method_name in sorted(os.listdir(methods_dir)):
+        method_dir = os.path.join(methods_dir, method_name)
+        if not os.path.isdir(method_dir):
+            continue
+
+        expected = _method_best_weight_paths(method_dir)
+        if not all(os.path.isfile(path) for path in expected.values()):
+            method_summary_path = os.path.join(method_dir, "val_summary.csv")
+            method_rows = None
+            if os.path.isfile(method_summary_path):
+                method_rows = pd.read_csv(method_summary_path).to_dict(orient="records")
+            elif root_val_df is not None and "method" in root_val_df.columns:
+                method_rows = root_val_df.loc[root_val_df["method"].astype(str) == method_name].to_dict(orient="records")
+            if method_rows:
+                write_val_selection_summaries(method_rows, val_dir)
+
+        if all(os.path.isfile(path) for path in expected.values()):
+            for strategy, path in expected.items():
+                collected[strategy].append(path)
+
+    return collected
+
+
+
+def _ensure_val_best_weight_outputs(logs_dir: str) -> dict[str, list[str]]:
+    val_dir = _resolve_val_summary_dir(logs_dir)
+    per_method_paths = _collect_per_method_best_weight_paths(val_dir)
+    if all(per_method_paths[strategy] for strategy in ("roc_auc", "prc_auc", "pareto")):
+        return per_method_paths
+
+    val_summary_path = os.path.join(val_dir, "val_summary.csv")
+    if os.path.isfile(val_summary_path):
+        rows = pd.read_csv(val_summary_path).to_dict(orient="records")
+        write_val_selection_summaries(rows, val_dir)
+        per_method_paths = _collect_per_method_best_weight_paths(val_dir)
+        if all(per_method_paths[strategy] for strategy in ("roc_auc", "prc_auc", "pareto")):
+            return per_method_paths
+
+    legacy_paths = _legacy_best_weight_paths(val_dir)
+    if all(os.path.isfile(path) for path in legacy_paths.values()):
+        return {strategy: [path] for strategy, path in legacy_paths.items()}
+
+    raise FileNotFoundError(
+        f"Missing validation best-weight outputs under {val_dir}. Run failure_prob/pipeline/val_new.py first."
+    )
+
+
+
+def _load_best_weights_df(paths: str | list[str]) -> pd.DataFrame:
+    if isinstance(paths, str):
+        paths = [paths]
+    if not paths:
+        raise FileNotFoundError("No best-weight files were provided")
+
+    frames = []
+    for path in paths:
+        if not os.path.isfile(path):
+            raise FileNotFoundError(f"Missing best-weight file: {path}")
+        frames.append(pd.read_csv(path))
+
+    df = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+    if df.empty:
+        return df
+
+    sort_cols = [col for col in ("method", "mode", "weight_key", "delta") if col in df.columns]
+    if sort_cols:
+        df = df.sort_values(by=sort_cols).reset_index(drop=True)
+    return df
 
 
 
