@@ -11,6 +11,7 @@ set -euo pipefail
 #   scripts/pipeline_new/val_new.sh --logs-dir log_ckpt_new/pizero_fast
 #   scripts/pipeline_new/val_new.sh --gpu 0 --logs-dir log_ckpt_new/pizero_fast --save-dir /tmp/val_new
 #   scripts/pipeline_new/val_new.sh --logs-dir log_ckpt_new/pizero_fast --method trans
+#   scripts/pipeline_new/val_new.sh --logs-dir log_ckpt_new/pizero_fast --summary-only
 
 resolve_default_logs_dir() {
     if [ -n "${PIPELINE_NEW_LOGS_DIR:-}" ]; then
@@ -33,6 +34,7 @@ gpu_id="${CUDA_VISIBLE_DEVICES:-}"
 logs_dir=""
 save_dir=""
 method_name=""
+summary_only=0
 
 while [ "$#" -gt 0 ]; do
     case "$1" in
@@ -67,6 +69,10 @@ while [ "$#" -gt 0 ]; do
             fi
             method_name="$2"
             shift 2
+            ;;
+        --summary-only)
+            summary_only=1
+            shift
             ;;
         -h|--help)
             sed -n '1,12p' "$0"
@@ -112,6 +118,10 @@ cmd=(
 
 if [ -n "${method_name}" ]; then
     cmd+=(--method "${method_name}")
+fi
+
+if [ "${summary_only}" -eq 1 ]; then
+    cmd+=(--summary-only)
 fi
 
 printf 'Running:'

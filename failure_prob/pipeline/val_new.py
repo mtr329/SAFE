@@ -11,6 +11,7 @@ import torch
 from matplotlib.figure import Figure
 from omegaconf import OmegaConf
 from torch.utils.data import DataLoader
+from tqdm import tqdm
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
@@ -844,6 +845,53 @@ def write_val_selection_summaries(
     }
 
 
+def _load_existing_val_rows(save_dir: str, method_filter: str | None = None) -> tuple[list[dict], list[dict]]:
+    methods_dir = os.path.join(os.path.abspath(save_dir), "methods")
+    method_filters = _normalize_method_filters(method_filter)
+    if not os.path.isdir(methods_dir):
+        return [], [{
+            "run_name": None,
+            "run_dir": None,
+            "method": None,
+            "skip_reason": f"missing_methods_dir:{methods_dir}",
+        }]
+
+    rows = []
+    skipped_runs = []
+    method_names = sorted(os.listdir(methods_dir))
+    pbar = tqdm(method_names, desc="Loading saved val summaries", unit="method")
+    for method_name in pbar:
+        method_dir = os.path.join(methods_dir, method_name)
+        if not os.path.isdir(method_dir):
+            continue
+        if method_filters is not None and method_name not in method_filters:
+            skipped_runs.append({
+                "run_name": None,
+                "run_dir": None,
+                "method": method_name,
+                "skip_reason": "method_filter",
+            })
+            continue
+
+        summary_path = os.path.join(method_dir, "val_summary.csv")
+        if not os.path.isfile(summary_path):
+            skipped_runs.append({
+                "run_name": None,
+                "run_dir": None,
+                "method": method_name,
+                "skip_reason": f"missing_val_summary:{summary_path}",
+            })
+            continue
+
+        method_df = pd.read_csv(summary_path)
+        if method_df.empty:
+            continue
+        rows.extend(method_df.to_dict(orient="records"))
+        pbar.set_postfix(method=method_name, runs=len(rows), refresh=False)
+
+    return rows, skipped_runs
+
+
 def _write_method_batch_sidecars(
     save_dir: str,
     failures: list[dict],
@@ -1016,6 +1064,25 @@ def run_batch_validation(logs_dir: str, save_dir: str, method_filter: str | None
     }
 
 
+def run_summary_only(save_dir: str, method_filter: str | None = None) -> dict:
+    save_dir = os.path.abspath(save_dir)
+    os.makedirs(save_dir, exist_ok=True)
+
+    rows, skipped_runs = _load_existing_val_rows(save_dir, method_filter=method_filter)
+    selection_payload = write_val_selection_summaries(rows, save_dir)
+    _write_method_batch_sidecars(save_dir, failures=[], skipped_runs=skipped_runs)
+    return {
+        "logs_dir": None,
+        "save_dir": save_dir,
+        "methods_dir": selection_payload.get("methods_dir", os.path.join(save_dir, "methods")),
+        "method_filter": sorted(_normalize_method_filters(method_filter)) if _normalize_method_filters(method_filter) is not None else None,
+        "num_runs": len(rows),
+        "num_failures": 0,
+        "num_skipped": len(skipped_runs),
+        **selection_payload,
+    }
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Run train/validation-only metrics for trained checkpoints and save per-run val logs plus per-method summaries.",
@@ -1035,10 +1102,18 @@ def main() -> None:
         default=None,
         help="Optional method name filter. Use exact method names such as 'trans' or 'embed_cosine'. Multiple values can be comma-separated.",
     )
+    parser.add_argument(
+        "--summary-only",
+        action="store_true",
+        help="Reuse existing <save-dir>/methods/*/val_summary.csv and val/*.json files to rebuild pareto summaries without re-running validation.",
+    )
     args = parser.parse_args()
 
     save_dir = args.save_dir or os.path.join(os.path.abspath(args.logs_dir), "pipeline_val_new")
-    result = run_batch_validation(args.logs_dir, save_dir, method_filter=args.method)
+    if args.summary_only:
+        result = run_summary_only(save_dir, method_filter=args.method)
+    else:
+        result = run_batch_validation(args.logs_dir, save_dir, method_filter=args.method)
     print("Saved per-method validation outputs under", os.path.abspath(result["methods_dir"]))
     print(f"runs={result['num_runs']}")
 

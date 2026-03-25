@@ -530,9 +530,11 @@ def _interp_det_time_on_pareto_for_bal_acc(
     pareto_bal_accs: np.ndarray,
     target_bal_acc: float,
 ) -> float:
-    if pareto_det_times.size < 2 or pareto_bal_accs.size < 2:
+    if pareto_det_times.size == 0 or pareto_bal_accs.size == 0:
         return np.nan
-    if target_bal_acc < pareto_bal_accs.min() or target_bal_acc > pareto_bal_accs.max():
+    if target_bal_acc <= pareto_bal_accs.min():
+        return float(pareto_det_times[0])
+    if target_bal_acc > pareto_bal_accs.max():
         return np.nan
     return float(np.interp(target_bal_acc, pareto_bal_accs, pareto_det_times))
 
