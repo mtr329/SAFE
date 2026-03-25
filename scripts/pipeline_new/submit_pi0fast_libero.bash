@@ -160,12 +160,12 @@ CACHE_DIR=./dataset_cache
 #     train.exp_suffix=handcrafted
 
 # Trans
-# Focused follow-up sweep.
-# Keep the current strong baseline fixed, and only scan:
-# 1. prefix pairwise AUC weight
-# 2. prefix time discount gamma
-# 3. soft detection weight
-# Total: 2 lambdas x 2 gammas x 2 soft weights x 3 seeds = 24 runs.
+# Focused structure/input sweep.
+# Fix a stronger optimization setup and the current best loss shape, then only scan:
+# 1. input feature view
+# 2. token position view
+# 3. history window size
+# Total: 2 features x 2 token views x 2 history sizes x 3 seeds = 24 runs.
 python -m failure_prob.pipeline.train_new \
     --multirun \
     train.wandb_group_name=${GROUP_NAME} \
@@ -174,32 +174,39 @@ python -m failure_prob.pipeline.train_new \
     dataset.data_path_prefix=${SAFE_OPENPI_ROLLOUT_ROOT} \
     dataset.use_cache=True \
     dataset.cache_dir=${CACHE_DIR} \
-    dataset.feat_name=pre_logits \
-    dataset.token_idx_rel=mean \
+    dataset.feat_name=pre_logits,encoded \
+    dataset.token_idx_rel=mean,1.0 \
     model=trans \
     train.roc_every=10 \
+    model.optimizer=adamw \
     model.lr=1e-4 \
+    model.weight_decay=1e-4 \
+    model.warmup_steps=500 \
+    model.hidden_dim=128 \
+    model.ff_dim=256 \
+    model.n_layers=2 \
+    model.n_heads=4 \
     model.dropout=0.15 \
-    model.lambda_reg=0.1 \
+    model.lambda_reg=0.05 \
     model.cumsum=True \
     model.use_time_weighting=True \
     model.use_class_conditional_time_weights=True \
-    model.n_history_steps=16 \
+    model.n_history_steps=16,32 \
     model.aux_warmup_epochs=10 \
     model.aux_ramp_epochs=25 \
     model.lambda_pairwise_auc=0.03 \
     model.pairwise_auc_beta=5.0 \
     model.use_prefix_pairwise_auc=True \
-    model.lambda_prefix_pairwise_auc=0.08,0.10 \
+    model.lambda_prefix_pairwise_auc=0.08 \
     model.prefix_pairwise_ratios='[0.1,0.2,0.35]' \
     model.prefix_pairwise_weights='[0.5,1.0,0.7]' \
-    model.prefix_pairwise_time_discount_gamma=0.10,0.25 \
+    model.prefix_pairwise_time_discount_gamma=0.25 \
     model.lambda_prefix_monitor=0.05 \
     model.prefix_monitor_ratios='[0.1,0.2,0.35]' \
     model.prefix_monitor_weights='[0.5,1.0,0.7]' \
     model.use_soft_detection_loss=True \
-    model.lambda_soft_detection=0.10,0.15 \
+    model.lambda_soft_detection=0.10 \
     model.soft_detection_threshold=0.45 \
     model.soft_detection_temperature=0.08 \
     train.seed=0-1-2 \
-    train.exp_suffix=trans_early_scan_v2
+    train.exp_suffix=trans_struct_input_scan
