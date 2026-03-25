@@ -160,8 +160,10 @@ CACHE_DIR=./dataset_cache
 #     train.exp_suffix=handcrafted
 
 # Trans
-# Focused second-round sweep: keep middle-history settings and soften the early losses.
-# This gives 12 settings per seed while testing whether ROC/PRC can recover without losing the integral gains.
+# Focused early-detection sweep in scan-parameter form.
+# Keep the architecture and loss shape fixed to a stronger baseline, and only scan
+# the two most relevant early-detection knobs.
+# Total: 2 gammas x 2 prefix-AUC weights x 3 seeds = 12 runs.
 python -m failure_prob.pipeline.train_new \
     --multirun \
     train.wandb_group_name=${GROUP_NAME} \
@@ -175,23 +177,27 @@ python -m failure_prob.pipeline.train_new \
     model=trans \
     train.roc_every=10 \
     model.lr=1e-4 \
-    model.dropout=0.2 \
+    model.dropout=0.15 \
     model.lambda_reg=0.1 \
     model.cumsum=True \
     model.use_time_weighting=True \
     model.use_class_conditional_time_weights=True \
-    model.use_soft_detection_loss=True \
-    model.lambda_soft_detection=0.08,0.10,0.12 \
-    model.soft_detection_temperature=0.05 \
-    model.n_history_steps=4,8 \
-    model.aux_warmup_epochs=5 \
-    model.aux_ramp_epochs=30 \
+    model.n_history_steps=16 \
+    model.aux_warmup_epochs=10 \
+    model.aux_ramp_epochs=25 \
     model.lambda_pairwise_auc=0.03 \
     model.pairwise_auc_beta=5.0 \
     model.use_prefix_pairwise_auc=True \
-    model.lambda_prefix_pairwise_auc=0.03 \
-    model.prefix_pairwise_ratios='[0.2,0.4]' \
-    model.lambda_prefix_monitor=0.03,0.05 \
-    model.prefix_monitor_ratios='[0.2,0.4]' \
+    model.lambda_prefix_pairwise_auc=0.06,0.08 \
+    model.prefix_pairwise_ratios='[0.1,0.2,0.35]' \
+    model.prefix_pairwise_weights='[0.5,1.0,0.7]' \
+    model.prefix_pairwise_time_discount_gamma=0.25,0.35 \
+    model.lambda_prefix_monitor=0.05 \
+    model.prefix_monitor_ratios='[0.1,0.2,0.35]' \
+    model.prefix_monitor_weights='[0.5,1.0,0.7]' \
+    model.use_soft_detection_loss=True \
+    model.lambda_soft_detection=0.1 \
+    model.soft_detection_threshold=0.45 \
+    model.soft_detection_temperature=0.08 \
     train.seed=0-1-2 \
-    train.exp_suffix=trans
+    train.exp_suffix=trans_early_scan

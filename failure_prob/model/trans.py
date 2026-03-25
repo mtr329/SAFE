@@ -55,11 +55,28 @@ class TransModel(BaseModel):
             getattr(cfg.model, "prefix_pairwise_ratios", None),
             fallback_ratio=self.prefix_pairwise_ratio,
         )
+        self.prefix_pairwise_weights = self._resolve_ratio_weights(
+            getattr(cfg.model, "prefix_pairwise_weights", None),
+            self.prefix_pairwise_ratios,
+            "prefix_pairwise_weights",
+        )
+        self.prefix_pairwise_time_discount_gamma = float(
+            getattr(cfg.model, "prefix_pairwise_time_discount_gamma", 0.0)
+        )
+        if self.prefix_pairwise_time_discount_gamma < 0.0:
+            raise ValueError(
+                "prefix_pairwise_time_discount_gamma must be non-negative"
+            )
         self.lambda_prefix_monitor = cfg.model.lambda_prefix_monitor
         self.prefix_monitor_ratio = cfg.model.prefix_monitor_ratio
         self.prefix_monitor_ratios = self._resolve_prefix_ratios(
             getattr(cfg.model, "prefix_monitor_ratios", None),
             fallback_ratio=self.prefix_monitor_ratio,
+        )
+        self.prefix_monitor_weights = self._resolve_ratio_weights(
+            getattr(cfg.model, "prefix_monitor_weights", None),
+            self.prefix_monitor_ratios,
+            "prefix_monitor_weights",
         )
         self.use_class_conditional_time_weights = cfg.model.use_class_conditional_time_weights
         self.use_soft_detection_loss = cfg.model.use_soft_detection_loss
@@ -106,6 +123,54 @@ class TransModel(BaseModel):
             resolved.append(fallback_ratio)
 
         return resolved
+
+
+    def _resolve_ratio_weights(
+        self,
+        weights: list[float] | tuple[float, ...] | None,
+        ratios: list[float],
+        name: str,
+    ) -> list[float]:
+        if weights is None:
+            weights = []
+
+        if len(weights) == 0:
+            return [1.0] * len(ratios)
+        if len(weights) != len(ratios):
+            raise ValueError(
+                f"{name} length must match ratios length: {len(weights)} != {len(ratios)}"
+            )
+
+        resolved = []
+        for weight in list(weights):
+            weight = float(weight)
+            if weight <= 0.0:
+                raise ValueError(f"{name} entries must be positive, got {weight}")
+            resolved.append(weight)
+        return resolved
+
+
+    def _weighted_mean(
+        self,
+        losses: list[torch.Tensor],
+        weights: list[float],
+        ref: torch.Tensor,
+    ) -> torch.Tensor:
+        if not losses:
+            return ref.new_tensor(0.0)
+        loss_tensor = torch.stack(losses)
+        weight_tensor = ref.new_tensor(weights)
+        return (loss_tensor * weight_tensor).sum() / weight_tensor.sum().clamp_min(1e-12)
+
+
+    def _build_normalized_time_index(self, valid_masks: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
+        valid_masks = valid_masks.to(dtype=dtype)
+        B, T = valid_masks.shape
+        seq_lengths = valid_masks.sum(dim=1).clamp(min=1.0)
+        denom = torch.clamp(seq_lengths - 1.0, min=1.0)
+        t_idx = torch.arange(T, device=valid_masks.device, dtype=dtype).unsqueeze(0).expand(B, -1)
+        t_norm = torch.minimum(t_idx / denom.unsqueeze(1), torch.ones_like(t_idx))
+        return t_norm * valid_masks
 
 
     def _positional_encoding(self, length: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
@@ -181,6 +246,7 @@ class TransModel(BaseModel):
         scores: torch.Tensor,
         labels: torch.Tensor,
         valid_masks: torch.Tensor,
+        time_discount_gamma: float = 0.0,
     ) -> torch.Tensor:
         # Compute a differentiable pairwise AUC loss on sequence-level scores.
         # scores: (B, T), labels: (B,), valid_masks: (B, T)
@@ -188,9 +254,14 @@ class TransModel(BaseModel):
         if scores.numel() == 0:
             return scores.new_tensor(0.0)
 
+        adjusted_scores = scores
+        if time_discount_gamma > 0.0:
+            t_norm = self._build_normalized_time_index(valid_masks, scores.dtype)
+            adjusted_scores = adjusted_scores - float(time_discount_gamma) * t_norm
+
         masked_scores = torch.where(
             valid_masks > 0.5,
-            scores,
+            adjusted_scores,
             torch.tensor(-float("inf"), device=scores.device, dtype=scores.dtype),
         )
         beta = float(self.pairwise_auc_beta)
@@ -281,11 +352,7 @@ class TransModel(BaseModel):
         detect_probs = torch.sigmoid((scores - threshold) / temperature) * valid_masks
         detect_probs = detect_probs.clamp(min=0.0, max=1.0 - eps)
 
-        B, T = detect_probs.shape
-        seq_lengths = valid_masks.sum(dim=1).clamp(min=1.0)
-        denom = torch.clamp(seq_lengths - 1.0, min=1.0)
-        t_idx = torch.arange(T, device=scores.device, dtype=scores.dtype).unsqueeze(0).expand(B, -1)
-        t_norm = torch.minimum(t_idx / denom.unsqueeze(1), torch.ones_like(t_idx))
+        t_norm = self._build_normalized_time_index(valid_masks, scores.dtype)
 
         log_survival = torch.cumsum(torch.log(torch.clamp(1.0 - detect_probs, min=eps)), dim=1)
         prev_log_survival = F.pad(log_survival[:, :-1], (1, 0), value=0.0)
@@ -384,7 +451,8 @@ class TransModel(BaseModel):
         prefix_monitor_loss = torch.tensor(0.0).to(scores)
         if self.lambda_prefix_monitor > 0:
             prefix_monitor_losses = []
-            for ratio in self.prefix_monitor_ratios:
+            prefix_monitor_weights = []
+            for ratio, ratio_weight in zip(self.prefix_monitor_ratios, self.prefix_monitor_weights):
                 prefix_valid_masks = self._build_prefix_valid_masks(valid_masks, ratio=ratio)
                 ratio_loss, _, _ = aggregate_monitor_loss(
                     losses,
@@ -394,7 +462,12 @@ class TransModel(BaseModel):
                     self.cfg.model.one_loss_per_seq,
                 )
                 prefix_monitor_losses.append(ratio_loss)
-            prefix_monitor_loss = torch.stack(prefix_monitor_losses).mean()
+                prefix_monitor_weights.append(ratio_weight)
+            prefix_monitor_loss = self._weighted_mean(
+                prefix_monitor_losses,
+                prefix_monitor_weights,
+                scores,
+            )
             prefix_monitor_loss = aux_loss_scale * self.lambda_prefix_monitor * prefix_monitor_loss
 
         # Now that we want to do classification based on the max scores before termination
@@ -420,11 +493,22 @@ class TransModel(BaseModel):
         prefix_pairwise_auc_loss = torch.tensor(0.0).to(scores)
         if self.use_prefix_pairwise_auc and self.lambda_prefix_pairwise_auc > 0:
             prefix_pairwise_losses = []
-            for ratio in self.prefix_pairwise_ratios:
+            prefix_pairwise_weights = []
+            for ratio, ratio_weight in zip(self.prefix_pairwise_ratios, self.prefix_pairwise_weights):
                 prefix_valid_masks = self._build_prefix_valid_masks(valid_masks, ratio=ratio)
-                ratio_loss = self._pairwise_auc_loss(scores, failure_labels, prefix_valid_masks)
+                ratio_loss = self._pairwise_auc_loss(
+                    scores,
+                    failure_labels,
+                    prefix_valid_masks,
+                    time_discount_gamma=self.prefix_pairwise_time_discount_gamma,
+                )
                 prefix_pairwise_losses.append(ratio_loss)
-            prefix_pairwise_auc_loss = torch.stack(prefix_pairwise_losses).mean()
+                prefix_pairwise_weights.append(ratio_weight)
+            prefix_pairwise_auc_loss = self._weighted_mean(
+                prefix_pairwise_losses,
+                prefix_pairwise_weights,
+                scores,
+            )
             prefix_pairwise_auc_loss = aux_loss_scale * self.lambda_prefix_pairwise_auc * prefix_pairwise_auc_loss
 
         soft_detection_loss = torch.tensor(0.0).to(scores)
