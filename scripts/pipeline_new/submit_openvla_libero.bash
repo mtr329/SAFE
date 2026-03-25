@@ -165,13 +165,12 @@ OPENVLA_TRANS_BATCH_SIZE="${OPENVLA_TRANS_BATCH_SIZE:-32}"
 # done
 
 # Trans
-# Small shared local sweep around the current best trans settings.
+# Small shared follow-up sweep around the current local-gate best settings.
 # Only explore new points that were not in the previous scan:
-#   - keep the strong shared defaults fixed,
-#   - drop the weaker 32-step history,
-#   - turn on time gating,
-#   - probe two new soft-detection weights and two gate inits.
-# Total: 2 history sizes x 2 soft-detection weights x 2 gate inits x 3 seeds = 24 runs per dataset.
+#   - interpolate between the previous history choices,
+#   - probe a weaker and a midpoint soft-detection weight,
+#   - use a midpoint gate init.
+# Total: 2 history sizes x 2 soft-detection weights x 3 seeds = 12 runs per dataset.
 for SUITE_NAME in 10; do
     python -m failure_prob.pipeline.train_new \
         --multirun \
@@ -216,9 +215,9 @@ for SUITE_NAME in 10; do
         model.prefix_monitor_ratios='[0.1,0.2,0.35]' \
         model.prefix_monitor_weights='[0.5,1.0,0.7]' \
         model.use_soft_detection_loss=True \
-        model.lambda_soft_detection=0.03,0.08 \
+        model.lambda_soft_detection=0.02,0.05 \
         model.soft_detection_threshold=0.45 \
         model.soft_detection_temperature=0.08 \
         train.seed=0-1-2 \
-        train.exp_suffix=trans_shared_local_gate_scan
+        train.exp_suffix=trans_shared_local_gate_refine
 done
