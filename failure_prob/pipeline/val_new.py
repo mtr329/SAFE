@@ -1,4 +1,5 @@
 import argparse
+import hashlib
 import json
 import os
 import sys
@@ -57,6 +58,8 @@ VAL_SPLITS = ("train", "val_seen", "val_unseen")
 ALPHAS = [0.02, 0.05, 0.1, 0.15, 0.2, 0.25, 0.3, 0.35, 0.4, 0.45, 0.5, 0.6, 0.7, 0.8, 0.9]
 
 VAL_SPLIT = VAL_SPLITS[-1]
+ORI_SELECTION_SPLIT = VAL_SPLITS[1]
+NEW_SELECTION_CALIB_KEY = "selection_calib"
 PARETO_INTEGRAL_EARLY_BAL_ACC_MIN = 0.6
 PARETO_INTEGRAL_EARLY_BAL_ACC_MAX = 0.8
 PARETO_INTEGRAL_LAST_BAL_ACC_MIN = 0.7
@@ -117,6 +120,88 @@ def _require_val_splits(rollouts_by_split_name: dict[str, list]) -> dict[str, li
     if missing:
         raise KeyError(f"Missing required splits: {missing}")
     return {split: rollouts_by_split_name[split] for split in VAL_SPLITS}
+
+
+def _rollout_fold_identity(rollout) -> dict[str, object]:
+    return {
+        "task_suite_name": getattr(rollout, "task_suite_name", None),
+        "task_id": getattr(rollout, "task_id", None),
+        "episode_idx": getattr(rollout, "episode_idx", None),
+        "episode_success": int(getattr(rollout, "episode_success", 0)),
+        "mp4_path": getattr(rollout, "mp4_path", None),
+    }
+
+
+def _stratified_two_fold_indices(rollouts: list, seed: int) -> tuple[list[int], list[int]]:
+    groups: dict[tuple[object, object, int], list[tuple[str, int]]] = {}
+    for index, rollout in enumerate(rollouts):
+        identity = _rollout_fold_identity(rollout)
+        group_key = (
+            identity["task_suite_name"],
+            identity["task_id"],
+            int(identity["episode_success"]),
+        )
+        payload = json.dumps(identity, sort_keys=True, separators=(",", ":"))
+        stable_key = hashlib.md5(f"{seed}|{payload}".encode("utf-8")).hexdigest()
+        groups.setdefault(group_key, []).append((stable_key, index))
+
+    folds = ([], [])
+    for group_key in sorted(groups, key=str):
+        for offset, (_, index) in enumerate(sorted(groups[group_key])):
+            folds[offset % 2].append(index)
+
+    return tuple(sorted(fold) for fold in folds)
+
+
+def _subset_and_pad_scores(scores_by_index: list[np.ndarray], indices: list[int]) -> tuple[list, list[np.ndarray]]:
+    if not indices:
+        return [], []
+    selected = [np.asarray(scores_by_index[index], dtype=float) for index in indices]
+    max_length = max(len(scores) for scores in selected)
+    padded = [np.pad(scores, (0, max_length - len(scores)), mode="edge") for scores in selected]
+    return indices, padded
+
+
+def _get_new_selection_metrics_for_validation(
+    scores_by_split_name: dict[str, list[np.ndarray]],
+    rollouts_by_split_name: dict[str, list],
+    method_name: str,
+    seed: int,
+    res_dict: dict,
+) -> None:
+    seen_rollouts = list(rollouts_by_split_name["val_seen"])
+    seen_scores = [np.asarray(scores, dtype=float) for scores in scores_by_split_name["val_seen"]]
+    if len(seen_rollouts) < 2 or len(seen_scores) < 2:
+        return
+
+    fold0, fold1 = _stratified_two_fold_indices(seen_rollouts, int(seed))
+    fold_pairs = ((fold0, fold1), (fold1, fold0))
+    selection_wrapper = {}
+
+    for select_indices, calib_indices in fold_pairs:
+        if not select_indices or not calib_indices:
+            continue
+
+        calib_rollouts = [seen_rollouts[index] for index in calib_indices]
+        select_rollouts = [seen_rollouts[index] for index in select_indices]
+        _, calib_scores = _subset_and_pad_scores(seen_scores, calib_indices)
+        _, select_scores = _subset_and_pad_scores(seen_scores, select_indices)
+        if not calib_scores or not select_scores:
+            continue
+
+        max_length = max(
+            max(len(scores) for scores in calib_scores),
+            max(len(scores) for scores in select_scores),
+        )
+        calib_scores = [np.pad(scores, (0, max_length - len(scores)), mode="edge") for scores in calib_scores]
+        select_scores = [np.pad(scores, (0, max_length - len(scores)), mode="edge") for scores in select_scores]
+        cp_bands_by_alpha = get_func_conformal_bands(calib_rollouts, calib_scores, ALPHAS)
+        _get_delay_calib_res(select_rollouts, select_scores, cp_bands_by_alpha, ALPHAS, method_name, selection_wrapper)
+
+    selection_calib = selection_wrapper.get("calib", {}).get(method_name)
+    if selection_calib:
+        res_dict.setdefault(NEW_SELECTION_CALIB_KEY, {})
+        res_dict[NEW_SELECTION_CALIB_KEY][method_name] = selection_calib
 
 
 def _cfg_for_split_validation(cfg: Config, split_signature: dict) -> Config:
@@ -442,14 +527,14 @@ def summarize_mean_val_ori_metric(
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     rows = []
     for candidate in candidates:
-        roc_auc, prc_auc = _summarize_ori_metric(candidate["val_ori"], VAL_SPLIT)
+        roc_auc, prc_auc = _summarize_ori_metric(candidate["val_ori"], ORI_SELECTION_SPLIT)
         rows.append({
             "method": candidate["method"],
             "seed": candidate["seed"],
             "weight_key": candidate["weight_key"],
             "run_name": candidate["run_name"],
             "run_dir": candidate["run_dir"],
-            "val_split": VAL_SPLIT,
+            "val_split": ORI_SELECTION_SPLIT,
             "val_roc_auc_early": roc_auc,
             "val_prc_auc_early": prc_auc,
         })
@@ -544,7 +629,7 @@ def build_val_pareto_ranges(
 ) -> tuple[dict[tuple[str, str], dict], pd.DataFrame]:
     intervals_by_group: dict[tuple[str, str], list[dict]] = {}
     for candidate in candidates:
-        calib_logs = candidate["val_new"].get("calib", {})
+        calib_logs = candidate["val_new"].get(NEW_SELECTION_CALIB_KEY, candidate["val_new"].get("calib", {}))
         for mode, delta_dict in calib_logs.items():
             group_key = (candidate["method"], mode)
             for alpha_dict in delta_dict.values():
@@ -560,7 +645,7 @@ def build_val_pareto_ranges(
     all_group_keys = sorted({
         (candidate["method"], mode)
         for candidate in candidates
-        for mode in candidate["val_new"].get("calib", {}).keys()
+        for mode in candidate["val_new"].get(NEW_SELECTION_CALIB_KEY, candidate["val_new"].get("calib", {})).keys()
     })
     range_by_group = {}
     for method, mode in all_group_keys:
@@ -599,7 +684,7 @@ def score_val_pareto_candidates(
 ) -> pd.DataFrame:
     rows = []
     for candidate in candidates:
-        calib_logs = candidate["val_new"].get("calib", {})
+        calib_logs = candidate["val_new"].get(NEW_SELECTION_CALIB_KEY, candidate["val_new"].get("calib", {}))
         for mode, delta_dict in calib_logs.items():
             stats = range_by_group.get((candidate["method"], mode))
             if stats is None:
@@ -985,12 +1070,14 @@ def evaluate_run(log_dir: str, logs_dir: str) -> dict:
             for metric_name, scores_by_split_name in _get_handcrafted_scores(cfg, rollouts_by_split_name).items():
                 get_ori_metrics(scores_by_split_name, rollouts_by_split_name, metric_name, ori_logs)
                 _get_new_metrics_for_validation(scores_by_split_name, rollouts_by_split_name, metric_name, new_logs)
+                _get_new_selection_metrics_for_validation(scores_by_split_name, rollouts_by_split_name, metric_name, seed, new_logs)
         else:
             if ckpt_path is None:
                 raise ValueError("Missing checkpoint path for model validation")
             scores_by_split_name = _build_model_scores(cfg, rollouts_by_split_name, ckpt_path)
             get_ori_metrics(scores_by_split_name, rollouts_by_split_name, method_name, ori_logs)
             _get_new_metrics_for_validation(scores_by_split_name, rollouts_by_split_name, method_name, new_logs)
+            _get_new_selection_metrics_for_validation(scores_by_split_name, rollouts_by_split_name, method_name, seed, new_logs)
 
     save_dir = _val_dir(log_dir)
     os.makedirs(save_dir, exist_ok=True)

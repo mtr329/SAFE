@@ -26,6 +26,8 @@ from failure_prob.mrefine.delay_summary import (
 from failure_prob.mrefine.new_summary import _split_new_logs_by_method
 from failure_prob.mrefine.ori_summary import _split_ori_logs_by_method
 from failure_prob.pipeline.val_new import (
+    NEW_SELECTION_CALIB_KEY,
+    ORI_SELECTION_SPLIT,
     VAL_SPLITS,
     _method_name,
     _metric_mean,
@@ -281,14 +283,14 @@ def collect_val_candidates(logs_dir: str) -> list[dict]:
 def summarize_val_roc_auc(candidates: list[dict]) -> tuple[pd.DataFrame, pd.DataFrame]:
     rows = []
     for candidate in candidates:
-        roc_auc, prc_auc = _summarize_ori_metric(candidate["val_ori"], VAL_SPLIT)
+        roc_auc, prc_auc = _summarize_ori_metric(candidate["val_ori"], ORI_SELECTION_SPLIT)
         rows.append({
             "method": candidate["method"],
             "seed": candidate["seed"],
             "weight_key": _weight_key_from_run_name(candidate["run_name"]),
             "run_name": candidate["run_name"],
             "run_dir": candidate["run_dir"],
-            "val_split": VAL_SPLIT,
+            "val_split": ORI_SELECTION_SPLIT,
             "val_roc_auc_early": roc_auc,
             "val_prc_auc_early": prc_auc,
         })
@@ -361,7 +363,7 @@ def build_val_pareto_ranges(
 ) -> tuple[dict[tuple[str, str], dict], pd.DataFrame]:
     intervals_by_group: dict[tuple[str, str], list[dict]] = {}
     for candidate in candidates:
-        calib_logs = candidate["val_new"].get("calib", {})
+        calib_logs = candidate["val_new"].get(NEW_SELECTION_CALIB_KEY, candidate["val_new"].get("calib", {}))
         for mode, delta_dict in calib_logs.items():
             group_key = (candidate["method"], mode)
             for delta_key, alpha_dict in delta_dict.items():
@@ -378,7 +380,7 @@ def build_val_pareto_ranges(
     all_group_keys = sorted({
         (candidate["method"], mode)
         for candidate in candidates
-        for mode in candidate["val_new"].get("calib", {}).keys()
+        for mode in candidate["val_new"].get(NEW_SELECTION_CALIB_KEY, candidate["val_new"].get("calib", {})).keys()
     })
     range_by_group = {}
     for method, mode in all_group_keys:
@@ -419,7 +421,7 @@ def score_pareto_candidates(
 ) -> pd.DataFrame:
     rows = []
     for candidate in candidates:
-        calib_logs = candidate[source_key].get("calib", {})
+        calib_logs = candidate[source_key].get(NEW_SELECTION_CALIB_KEY, candidate[source_key].get("calib", {}))
         for mode, delta_dict in calib_logs.items():
             stats = range_by_group.get((candidate["method"], mode))
             if stats is None:

@@ -162,8 +162,9 @@ CACHE_DIR=./dataset_cache
 #     train.exp_suffix=handcrafted
 
 # Trans
-# Focused structure/input sweep.
-# Keep the same trans search recipe as pi0fast, but use the Pi0 input views.
+# Small shared tradeoff sweep.
+# Use the same model search space across all three datasets and keep the budget
+# small by only scanning three knobs that most directly affect pareto vs AUC.
 python -m failure_prob.pipeline.train_new \
     --multirun \
     train.wandb_group_name=${GROUP_NAME} \
@@ -173,8 +174,8 @@ python -m failure_prob.pipeline.train_new \
     dataset.data_path_prefix=${SAFE_OPENPI_ROLLOUT_ROOT} \
     dataset.use_cache=True \
     dataset.cache_dir=${CACHE_DIR} \
-    dataset.horizon_idx_rel=mean,1.0 \
-    dataset.diff_idx_rel=mean,1.0 \
+    dataset.horizon_idx_rel=mean \
+    dataset.diff_idx_rel=mean \
     model=trans \
     model.optimizer=adamw \
     model.lr=1e-4 \
@@ -189,13 +190,13 @@ python -m failure_prob.pipeline.train_new \
     model.cumsum=True \
     model.use_time_weighting=True \
     model.use_class_conditional_time_weights=True \
-    model.n_history_steps=16,32 \
+    model.n_history_steps=16,24 \
     model.aux_warmup_epochs=10 \
     model.aux_ramp_epochs=25 \
     model.lambda_pairwise_auc=0.03 \
     model.pairwise_auc_beta=5.0 \
     model.use_prefix_pairwise_auc=True \
-    model.lambda_prefix_pairwise_auc=0.08 \
+    model.lambda_prefix_pairwise_auc=0.04,0.08 \
     model.prefix_pairwise_ratios='[0.1,0.2,0.35]' \
     model.prefix_pairwise_weights='[0.5,1.0,0.7]' \
     model.prefix_pairwise_time_discount_gamma=0.25 \
@@ -203,8 +204,8 @@ python -m failure_prob.pipeline.train_new \
     model.prefix_monitor_ratios='[0.1,0.2,0.35]' \
     model.prefix_monitor_weights='[0.5,1.0,0.7]' \
     model.use_soft_detection_loss=True \
-    model.lambda_soft_detection=0.10 \
+    model.lambda_soft_detection=0.05,0.10 \
     model.soft_detection_threshold=0.45 \
     model.soft_detection_temperature=0.08 \
     train.seed=0-1-2 \
-    train.exp_suffix=trans_struct_input_scan
+    train.exp_suffix=trans_shared_small_scan

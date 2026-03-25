@@ -10,6 +10,9 @@ export WANDB_MODE="${WANDB_MODE:-offline}"
 SAFE_OPENVLA_ROLLOUT_ROOT=/data1/mtr/data/safe_rollouts/openvla/
 WANDB_DIR=./wandb_new
 CACHE_DIR=./dataset_cache
+OPENVLA_USE_CACHE="${OPENVLA_USE_CACHE:-True}"
+OPENVLA_REFRESH_CACHE="${OPENVLA_REFRESH_CACHE:-False}"
+OPENVLA_TRANS_BATCH_SIZE="${OPENVLA_TRANS_BATCH_SIZE:-32}"
 
 # # LSTM and MLP
 # for SUITE_NAME in 10; do
@@ -162,8 +165,9 @@ CACHE_DIR=./dataset_cache
 # done
 
 # Trans
-# Focused structure/input sweep.
-# Keep the same trans search recipe as pi0fast, but use the OpenVLA token view.
+# Small shared tradeoff sweep.
+# Use the same model search space across all three datasets and keep the budget
+# small by only scanning three knobs that most directly affect pareto vs AUC.
 for SUITE_NAME in 10; do
     python -m failure_prob.pipeline.train_new \
         --multirun \
@@ -172,11 +176,13 @@ for SUITE_NAME in 10; do
         train.roc_every=10 \
         dataset=openvla_libero_${SUITE_NAME} \
         dataset.data_path_prefix=${SAFE_OPENVLA_ROLLOUT_ROOT} \
-        dataset.use_cache=True \
+        dataset.use_cache=${OPENVLA_USE_CACHE} \
+        dataset.refresh_cache=${OPENVLA_REFRESH_CACHE} \
         dataset.cache_dir=${CACHE_DIR} \
-        dataset.token_idx_rel=mean,1.0 \
+        dataset.token_idx_rel=mean \
         dataset.load_to_cuda=False \
         model=trans \
+        model.batch_size=${OPENVLA_TRANS_BATCH_SIZE} \
         model.optimizer=adamw \
         model.lr=1e-4 \
         model.weight_decay=1e-4 \
@@ -190,13 +196,13 @@ for SUITE_NAME in 10; do
         model.cumsum=True \
         model.use_time_weighting=True \
         model.use_class_conditional_time_weights=True \
-        model.n_history_steps=16,32 \
+        model.n_history_steps=16,24 \
         model.aux_warmup_epochs=10 \
         model.aux_ramp_epochs=25 \
         model.lambda_pairwise_auc=0.03 \
         model.pairwise_auc_beta=5.0 \
         model.use_prefix_pairwise_auc=True \
-        model.lambda_prefix_pairwise_auc=0.08 \
+        model.lambda_prefix_pairwise_auc=0.04,0.08 \
         model.prefix_pairwise_ratios='[0.1,0.2,0.35]' \
         model.prefix_pairwise_weights='[0.5,1.0,0.7]' \
         model.prefix_pairwise_time_discount_gamma=0.25 \
@@ -204,9 +210,9 @@ for SUITE_NAME in 10; do
         model.prefix_monitor_ratios='[0.1,0.2,0.35]' \
         model.prefix_monitor_weights='[0.5,1.0,0.7]' \
         model.use_soft_detection_loss=True \
-        model.lambda_soft_detection=0.10 \
+        model.lambda_soft_detection=0.05,0.10 \
         model.soft_detection_threshold=0.45 \
         model.soft_detection_temperature=0.08 \
         train.seed=0-1-2 \
-        train.exp_suffix=trans_struct_input_scan
+        train.exp_suffix=trans_shared_small_scan
 done

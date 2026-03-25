@@ -22,6 +22,7 @@ def _split_new_logs_by_method(
 ) -> dict[str, dict]:
     static_logs = new_logs.get("static", {})
     calib_logs = new_logs.get("calib", {})
+    selection_calib_logs = new_logs.get("selection_calib", {})
     soft_logs = new_logs.get("soft", {})
 
     if any(split in static_logs for split in ("train", "val_seen", "val_unseen")):
@@ -29,16 +30,18 @@ def _split_new_logs_by_method(
             fallback_method_name: {
                 "static": static_logs,
                 "calib": calib_logs,
+                "selection_calib": selection_calib_logs,
                 "soft": soft_logs,
             }
         }
 
-    method_names = set(static_logs.keys()) | set(calib_logs.keys()) | set(soft_logs.keys())
+    method_names = set(static_logs.keys()) | set(calib_logs.keys()) | set(selection_calib_logs.keys()) | set(soft_logs.keys())
     method_logs_by_name = {}
     for method_name in sorted(method_names):
         method_logs_by_name[method_name] = {
             "static": static_logs.get(method_name, {}),
             "calib": calib_logs.get(method_name, {}),
+            "selection_calib": selection_calib_logs.get(method_name, {}),
             "soft": soft_logs.get(method_name, {}),
         }
     return method_logs_by_name
