@@ -165,12 +165,13 @@ OPENVLA_TRANS_BATCH_SIZE="${OPENVLA_TRANS_BATCH_SIZE:-32}"
 # done
 
 # Trans
-# Small shared tradeoff sweep.
-# Use the same model search space across all three datasets and keep the budget
-# small by only scanning three knobs that most directly affect pareto vs AUC.
-# Add one longer history option while keeping the rest fixed, but only scan one
-# extra tradeoff knob to keep the budget small.
-# Total: 3 history sizes x 2 soft-detection weights x 3 seeds = 18 runs per dataset.
+# Small shared local sweep around the current best trans settings.
+# Only explore new points that were not in the previous scan:
+#   - keep the strong shared defaults fixed,
+#   - drop the weaker 32-step history,
+#   - turn on time gating,
+#   - probe two new soft-detection weights and two gate inits.
+# Total: 2 history sizes x 2 soft-detection weights x 2 gate inits x 3 seeds = 24 runs per dataset.
 for SUITE_NAME in 10; do
     python -m failure_prob.pipeline.train_new \
         --multirun \
@@ -199,11 +200,13 @@ for SUITE_NAME in 10; do
         model.cumsum=True \
         model.use_time_weighting=True \
         model.use_class_conditional_time_weights=True \
-        model.n_history_steps=16,24,32 \
+        model.n_history_steps=16,24 \
         model.aux_warmup_epochs=10 \
         model.aux_ramp_epochs=25 \
         model.lambda_pairwise_auc=0.03 \
         model.pairwise_auc_beta=5.0 \
+        model.use_time_gate=True \
+        model.time_gate_tau_init=0.15,0.30 \
         model.use_prefix_pairwise_auc=True \
         model.lambda_prefix_pairwise_auc=0.04 \
         model.prefix_pairwise_ratios='[0.1,0.2,0.35]' \
@@ -213,9 +216,9 @@ for SUITE_NAME in 10; do
         model.prefix_monitor_ratios='[0.1,0.2,0.35]' \
         model.prefix_monitor_weights='[0.5,1.0,0.7]' \
         model.use_soft_detection_loss=True \
-        model.lambda_soft_detection=0.05,0.10 \
+        model.lambda_soft_detection=0.03,0.08 \
         model.soft_detection_threshold=0.45 \
         model.soft_detection_temperature=0.08 \
         train.seed=0-1-2 \
-        train.exp_suffix=trans_shared_small_scan
+        train.exp_suffix=trans_shared_local_gate_scan
 done
