@@ -168,12 +168,15 @@ OPENVLA_TRANS_BATCH_SIZE="${OPENVLA_TRANS_BATCH_SIZE:-32}"
 # Small shared tradeoff sweep.
 # Use the same model search space across all three datasets and keep the budget
 # small by only scanning three knobs that most directly affect pareto vs AUC.
+# Add one longer history option while keeping the rest fixed, but only scan one
+# extra tradeoff knob to keep the budget small.
+# Total: 3 history sizes x 2 soft-detection weights x 3 seeds = 18 runs per dataset.
 for SUITE_NAME in 10; do
     python -m failure_prob.pipeline.train_new \
         --multirun \
         train.wandb_group_name=${GROUP_NAME} \
         train.wandb_dir=${WANDB_DIR}/openvla/trans \
-        train.roc_every=10 \
+        train.roc_every=100 \
         dataset=openvla_libero_${SUITE_NAME} \
         dataset.data_path_prefix=${SAFE_OPENVLA_ROLLOUT_ROOT} \
         dataset.use_cache=${OPENVLA_USE_CACHE} \
@@ -186,7 +189,7 @@ for SUITE_NAME in 10; do
         model.optimizer=adamw \
         model.lr=1e-4 \
         model.weight_decay=1e-4 \
-        model.warmup_steps=500 \
+        model.warmup_steps=40 \
         model.hidden_dim=128 \
         model.ff_dim=256 \
         model.n_layers=2 \
@@ -196,13 +199,13 @@ for SUITE_NAME in 10; do
         model.cumsum=True \
         model.use_time_weighting=True \
         model.use_class_conditional_time_weights=True \
-        model.n_history_steps=16,24 \
+        model.n_history_steps=16,24,32 \
         model.aux_warmup_epochs=10 \
         model.aux_ramp_epochs=25 \
         model.lambda_pairwise_auc=0.03 \
         model.pairwise_auc_beta=5.0 \
         model.use_prefix_pairwise_auc=True \
-        model.lambda_prefix_pairwise_auc=0.04,0.08 \
+        model.lambda_prefix_pairwise_auc=0.04 \
         model.prefix_pairwise_ratios='[0.1,0.2,0.35]' \
         model.prefix_pairwise_weights='[0.5,1.0,0.7]' \
         model.prefix_pairwise_time_discount_gamma=0.25 \
