@@ -60,6 +60,7 @@ ALPHAS = [0.02, 0.05, 0.1, 0.15, 0.2, 0.25, 0.3, 0.35, 0.4, 0.45, 0.5, 0.6, 0.7,
 VAL_SPLIT = VAL_SPLITS[-1]
 ORI_SELECTION_SPLIT = VAL_SPLITS[1]
 NEW_SELECTION_CALIB_KEY = "selection_calib"
+NEW_SELECTION_CALIB_FOLDS_KEY = "selection_calib_folds"
 PARETO_INTEGRAL_EARLY_BAL_ACC_MIN = 0.6
 PARETO_INTEGRAL_EARLY_BAL_ACC_MAX = 0.8
 PARETO_INTEGRAL_LAST_BAL_ACC_MIN = 0.7
@@ -162,6 +163,10 @@ def _subset_and_pad_scores(scores_by_index: list[np.ndarray], indices: list[int]
     return indices, padded
 
 
+def _serialize_rollout_identities(rollouts: list, indices: list[int]) -> list[dict[str, object]]:
+    return [_rollout_fold_identity(rollouts[index]) for index in indices]
+
+
 def _get_new_selection_metrics_for_validation(
     scores_by_split_name: dict[str, list[np.ndarray]],
     rollouts_by_split_name: dict[str, list],
@@ -177,8 +182,9 @@ def _get_new_selection_metrics_for_validation(
     fold0, fold1 = _stratified_two_fold_indices(seen_rollouts, int(seed))
     fold_pairs = ((fold0, fold1), (fold1, fold0))
     selection_wrapper = {}
+    fold_metadata = []
 
-    for select_indices, calib_indices in fold_pairs:
+    for fold_index, (select_indices, calib_indices) in enumerate(fold_pairs):
         if not select_indices or not calib_indices:
             continue
 
@@ -197,11 +203,23 @@ def _get_new_selection_metrics_for_validation(
         select_scores = [np.pad(scores, (0, max_length - len(scores)), mode="edge") for scores in select_scores]
         cp_bands_by_alpha = get_func_conformal_bands(calib_rollouts, calib_scores, ALPHAS)
         _get_delay_calib_res(select_rollouts, select_scores, cp_bands_by_alpha, ALPHAS, method_name, selection_wrapper)
+        fold_metadata.append({
+            "fold_index": int(fold_index),
+            "select_fold_name": f"fold{fold_index}",
+            "calib_fold_name": f"fold{1 - fold_index}",
+            "select_indices": [int(index) for index in select_indices],
+            "calib_indices": [int(index) for index in calib_indices],
+            "select_rollouts": _serialize_rollout_identities(seen_rollouts, select_indices),
+            "calib_rollouts": _serialize_rollout_identities(seen_rollouts, calib_indices),
+        })
 
     selection_calib = selection_wrapper.get("calib", {}).get(method_name)
     if selection_calib:
         res_dict.setdefault(NEW_SELECTION_CALIB_KEY, {})
         res_dict[NEW_SELECTION_CALIB_KEY][method_name] = selection_calib
+    if fold_metadata:
+        res_dict.setdefault(NEW_SELECTION_CALIB_FOLDS_KEY, {})
+        res_dict[NEW_SELECTION_CALIB_FOLDS_KEY][method_name] = fold_metadata
 
 
 def _cfg_for_split_validation(cfg: Config, split_signature: dict) -> Config:
@@ -429,6 +447,43 @@ def _save_new_outputs(save_dir: str, new_logs: dict) -> None:
     raw_df = pd.DataFrame(raw_rows)
     raw_df.to_csv(os.path.join(save_dir, "new_t_at_balacc_raw.csv"), index=False)
     raw_df[raw_df["is_pareto"]].to_csv(os.path.join(save_dir, "new_t_at_balacc_pareto.csv"), index=False)
+
+    selection_raw_rows = []
+    selection_calib_logs = new_logs.get(NEW_SELECTION_CALIB_KEY, {})
+    selection_fold_logs = new_logs.get(NEW_SELECTION_CALIB_FOLDS_KEY, {})
+    for method_name, calib_logs in selection_calib_logs.items():
+        fold_meta = selection_fold_logs.get(method_name, [])
+        for mode, delta_dict in calib_logs.items():
+            for delta, alpha_dict in delta_dict.items():
+                for alpha, metrics in alpha_dict.items():
+                    metric_names = [name for name in metrics.keys() if name != "detect_method"]
+                    num_folds = 0
+                    for metric_name in metric_names:
+                        num_folds = max(num_folds, len(metrics.get(metric_name, [])))
+                    for fold_index in range(num_folds):
+                        meta = fold_meta[fold_index] if fold_index < len(fold_meta) else {}
+                        row = {
+                            "method": method_name,
+                            "fold_index": int(fold_index),
+                            "select_fold_name": meta.get("select_fold_name"),
+                            "calib_fold_name": meta.get("calib_fold_name"),
+                            "mode": mode,
+                            "delta": float(delta),
+                            "alpha": float(alpha),
+                        }
+                        for metric_name in metric_names:
+                            values = metrics.get(metric_name, [])
+                            row[metric_name] = (
+                                float(values[fold_index])
+                                if fold_index < len(values)
+                                else np.nan
+                            )
+                        selection_raw_rows.append(row)
+
+    selection_raw_df = pd.DataFrame(selection_raw_rows)
+    selection_raw_df.to_csv(os.path.join(save_dir, "selection_calib_raw.csv"), index=False)
+    with open(os.path.join(save_dir, "selection_calib_folds.json"), "w") as f:
+        json.dump(selection_fold_logs, f, indent=2)
 
 
 def _extract_seed_from_run_name(run_name: str) -> int | None:
