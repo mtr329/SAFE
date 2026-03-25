@@ -160,10 +160,12 @@ CACHE_DIR=./dataset_cache
 #     train.exp_suffix=handcrafted
 
 # Trans
-# Focused early-detection sweep in scan-parameter form.
-# Keep the architecture and loss shape fixed to a stronger baseline, and only scan
-# the two most relevant early-detection knobs.
-# Total: 2 gammas x 2 prefix-AUC weights x 3 seeds = 12 runs.
+# Focused follow-up sweep.
+# Keep the current strong baseline fixed, and only scan:
+# 1. prefix pairwise AUC weight
+# 2. prefix time discount gamma
+# 3. soft detection weight
+# Total: 2 lambdas x 2 gammas x 2 soft weights x 3 seeds = 24 runs.
 python -m failure_prob.pipeline.train_new \
     --multirun \
     train.wandb_group_name=${GROUP_NAME} \
@@ -188,16 +190,16 @@ python -m failure_prob.pipeline.train_new \
     model.lambda_pairwise_auc=0.03 \
     model.pairwise_auc_beta=5.0 \
     model.use_prefix_pairwise_auc=True \
-    model.lambda_prefix_pairwise_auc=0.06,0.08 \
+    model.lambda_prefix_pairwise_auc=0.08,0.10 \
     model.prefix_pairwise_ratios='[0.1,0.2,0.35]' \
     model.prefix_pairwise_weights='[0.5,1.0,0.7]' \
-    model.prefix_pairwise_time_discount_gamma=0.25,0.35 \
+    model.prefix_pairwise_time_discount_gamma=0.10,0.25 \
     model.lambda_prefix_monitor=0.05 \
     model.prefix_monitor_ratios='[0.1,0.2,0.35]' \
     model.prefix_monitor_weights='[0.5,1.0,0.7]' \
     model.use_soft_detection_loss=True \
-    model.lambda_soft_detection=0.1 \
+    model.lambda_soft_detection=0.10,0.15 \
     model.soft_detection_threshold=0.45 \
     model.soft_detection_temperature=0.08 \
     train.seed=0-1-2 \
-    train.exp_suffix=trans_early_scan
+    train.exp_suffix=trans_early_scan_v2
