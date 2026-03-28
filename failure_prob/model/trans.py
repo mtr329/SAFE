@@ -67,6 +67,17 @@ class TransModel(BaseModel):
             raise ValueError(
                 "prefix_pairwise_time_discount_gamma must be non-negative"
             )
+        self.use_integral_pairwise_loss = bool(
+            getattr(cfg.model, "use_integral_pairwise_loss", False)
+        )
+        self.lambda_integral_pairwise_loss = float(
+            getattr(cfg.model, "lambda_integral_pairwise_loss", 0.0)
+        )
+        self.integral_pairwise_gamma = float(
+            getattr(cfg.model, "integral_pairwise_gamma", 0.0)
+        )
+        if self.integral_pairwise_gamma < 0.0:
+            raise ValueError("integral_pairwise_gamma must be non-negative")
         self.lambda_prefix_monitor = cfg.model.lambda_prefix_monitor
         self.prefix_monitor_ratio = cfg.model.prefix_monitor_ratio
         self.prefix_monitor_ratios = self._resolve_prefix_ratios(
@@ -276,6 +287,51 @@ class TransModel(BaseModel):
         # Pairwise logistic loss: encourage pos > neg.
         diff = pos[:, None] - neg[None, :]
         return torch.nn.functional.softplus(-diff).mean()
+
+
+    def _pairwise_ranking_loss(
+        self,
+        seq_scores: torch.Tensor,
+        labels: torch.Tensor,
+    ) -> torch.Tensor:
+        pos = seq_scores[labels > 0.5]
+        neg = seq_scores[labels <= 0.5]
+        if pos.numel() == 0 or neg.numel() == 0:
+            return seq_scores.new_tensor(0.0)
+
+        diff = pos[:, None] - neg[None, :]
+        return F.softplus(-diff).mean()
+
+
+    def _integral_sequence_scores(
+        self,
+        scores: torch.Tensor,
+        valid_masks: torch.Tensor,
+        gamma: float = 0.0,
+    ) -> torch.Tensor:
+        valid_masks = valid_masks.to(dtype=scores.dtype)
+        weights = valid_masks
+        if gamma > 0.0:
+            t_norm = self._build_normalized_time_index(valid_masks, scores.dtype)
+            weights = weights * torch.exp(-float(gamma) * t_norm)
+
+        denom = weights.sum(dim=1).clamp_min(1e-12)
+        return (scores * weights).sum(dim=1) / denom
+
+
+    def _integral_pairwise_loss(
+        self,
+        scores: torch.Tensor,
+        labels: torch.Tensor,
+        valid_masks: torch.Tensor,
+        gamma: float = 0.0,
+    ) -> torch.Tensor:
+        seq_scores = self._integral_sequence_scores(
+            scores,
+            valid_masks,
+            gamma=gamma,
+        )
+        return self._pairwise_ranking_loss(seq_scores, labels)
 
 
     def _build_prefix_valid_masks(
@@ -511,12 +567,31 @@ class TransModel(BaseModel):
             )
             prefix_pairwise_auc_loss = aux_loss_scale * self.lambda_prefix_pairwise_auc * prefix_pairwise_auc_loss
 
+        integral_pairwise_loss = torch.tensor(0.0).to(scores)
+        if self.use_integral_pairwise_loss and self.lambda_integral_pairwise_loss > 0:
+            integral_pairwise_loss = self._integral_pairwise_loss(
+                scores,
+                failure_labels,
+                valid_masks,
+                gamma=self.integral_pairwise_gamma,
+            )
+            integral_pairwise_loss = (
+                aux_loss_scale * self.lambda_integral_pairwise_loss * integral_pairwise_loss
+            )
+
         soft_detection_loss = torch.tensor(0.0).to(scores)
         if self.use_soft_detection_loss and self.lambda_soft_detection > 0:
             soft_detection_loss = self._soft_detection_loss(scores, failure_labels, valid_masks)
             soft_detection_loss = aux_loss_scale * self.lambda_soft_detection * soft_detection_loss
 
-        monitor_loss += prefix_monitor_loss + hard_neg_loss + pairwise_auc_loss + prefix_pairwise_auc_loss + soft_detection_loss
+        monitor_loss += (
+            prefix_monitor_loss
+            + hard_neg_loss
+            + pairwise_auc_loss
+            + prefix_pairwise_auc_loss
+            + integral_pairwise_loss
+            + soft_detection_loss
+        )
 
         # Log the losses
         logs = {
@@ -528,6 +603,7 @@ class TransModel(BaseModel):
             "hard_neg_loss": hard_neg_loss.item(),
             "pairwise_auc_loss": pairwise_auc_loss.item(),
             "prefix_pairwise_auc_loss": prefix_pairwise_auc_loss.item(),
+            "integral_pairwise_loss": integral_pairwise_loss.item(),
             "soft_detection_loss": soft_detection_loss.item(),
         }
         

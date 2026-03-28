@@ -223,6 +223,9 @@ class TransModelConfig(ModelConfig):
     prefix_pairwise_ratios: list[float] = field(default_factory=lambda: [0.2, 0.4])
     prefix_pairwise_weights: list[float] = field(default_factory=list)
     prefix_pairwise_time_discount_gamma: float = 0.0
+    use_integral_pairwise_loss: bool = False
+    lambda_integral_pairwise_loss: float = 0.0
+    integral_pairwise_gamma: float = 0.0
     lambda_prefix_monitor: float = 0.05
     prefix_monitor_ratio: float = 0.4
     prefix_monitor_ratios: list[float] = field(default_factory=lambda: [0.2, 0.4])
