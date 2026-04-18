@@ -162,12 +162,12 @@ CACHE_DIR=./dataset_cache
 #     train.exp_suffix=handcrafted
 
 # Trans
-# Keep the shared trans search compact:
-#   - retain the current backbone/local-gate settings,
-#   - only sweep history length,
-#   - test whether a stronger soft-detection term helps,
-#   - test the new integral pairwise branch.
-# Total: 2 history sizes x 2 soft-detection weights x 2 integral toggles x 3 seeds = 24 runs.
+# Small shared follow-up sweep around the current local-gate best settings.
+# Only explore new points that were not in the previous scan:
+#   - interpolate between the previous history choices,
+#   - probe a weaker and a midpoint soft-detection weight,
+#   - use a midpoint gate init.
+# Total: 2 history sizes x 2 soft-detection weights x 3 seeds = 12 runs.
 python -m failure_prob.pipeline.train_new \
     --multirun \
     train.wandb_group_name=${GROUP_NAME} \
@@ -199,7 +199,7 @@ python -m failure_prob.pipeline.train_new \
     model.lambda_pairwise_auc=0.03 \
     model.pairwise_auc_beta=5.0 \
     model.use_time_gate=True \
-    model.time_gate_tau_init=0.25 \
+    model.time_gate_tau_init=0.15,0.30 \
     model.use_prefix_pairwise_auc=True \
     model.lambda_prefix_pairwise_auc=0.04 \
     model.prefix_pairwise_ratios='[0.1,0.2,0.35]' \
@@ -212,8 +212,5 @@ python -m failure_prob.pipeline.train_new \
     model.lambda_soft_detection=0.02,0.05 \
     model.soft_detection_threshold=0.45 \
     model.soft_detection_temperature=0.08 \
-    model.use_integral_pairwise_loss=False,True \
-    model.lambda_integral_pairwise_loss=0.03 \
-    model.integral_pairwise_gamma=0.25 \
     train.seed=0-1-2 \
-    train.exp_suffix=trans_integral_refine_24
+    train.exp_suffix=trans_shared_local_gate_refine
