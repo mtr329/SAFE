@@ -4,7 +4,7 @@ import torch
 import torch.nn as nn
 
 from .base import BaseModel
-from .utils import aggregate_monitor_loss, cumsum_stopgrad
+from .utils import aggregate_monitor_loss, cumsum_stopgrad, get_time_weight
 
 from failure_prob.conf import Config
 
@@ -41,6 +41,9 @@ class TransModel(BaseModel):
         self.fc = nn.Linear(self.hidden_dim, 1)
         self.dropout = nn.Dropout(cfg.model.dropout)
         self.n_history_steps = cfg.model.n_history_steps
+        self.use_class_conditional_time_weights = (
+            cfg.model.use_class_conditional_time_weights
+        )
 
         self._scale_weights(self.cfg.model.init_weight_scale)
 
@@ -67,6 +70,26 @@ class TransModel(BaseModel):
         return torch.triu(
             torch.ones(length, length, device=device, dtype=torch.bool),
             diagonal=1,
+        )
+
+    def _build_time_weights(
+        self,
+        valid_masks: torch.Tensor,
+        success_labels: torch.Tensor,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        failure_time_weights = get_time_weight(
+            self.cfg.model.use_time_weighting,
+            valid_masks,
+        ).to(dtype=dtype)
+        if not self.use_class_conditional_time_weights:
+            return failure_time_weights
+
+        success_time_weights = valid_masks.to(dtype=dtype)
+        return torch.where(
+            success_labels[:, None] > 0.5,
+            success_time_weights,
+            failure_time_weights,
         )
 
     def forward(
@@ -127,10 +150,15 @@ class TransModel(BaseModel):
         success_labels = batch["success_labels"]
 
         scores = self(batch).squeeze(-1)
+        time_weights = self._build_time_weights(
+            valid_masks,
+            success_labels,
+            scores.dtype,
+        ).to(scores)
 
         if self.cfg.model.cumsum:
-            seq_loss_success = torch.relu(scores)
-            seq_loss_fail = -scores
+            seq_loss_success = time_weights * torch.relu(scores)
+            seq_loss_fail = time_weights * (-scores)
             losses = (
                 (success_labels == 1).float()[:, None] * seq_loss_success
                 + (success_labels == 0).float()[:, None] * seq_loss_fail
@@ -138,7 +166,7 @@ class TransModel(BaseModel):
         else:
             criterion = nn.BCELoss(reduction="none")
             targets = 1 - success_labels.unsqueeze(-1).expand_as(scores)
-            losses = criterion(scores, targets)
+            losses = criterion(scores, targets) * time_weights
 
         if weights is None:
             weights = [1.0, 1.0]

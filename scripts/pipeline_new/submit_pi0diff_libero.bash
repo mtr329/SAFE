@@ -34,6 +34,8 @@ python -m failure_prob.pipeline.train_new \
     model.dropout=0.15 \
     model.lambda_reg=0.05 \
     model.cumsum=True \
+    model.use_time_weighting=True \
+    model.use_class_conditional_time_weights=True \
     model.n_history_steps=16,24 \
     train.seed=0-1-2 \
     train.exp_suffix=trans

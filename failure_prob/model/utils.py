@@ -54,7 +54,7 @@ def get_time_weight(use_weighting, valid_masks):
         time_weights = torch.arange(T).to(valid_masks)  # (T,)
         time_weights = time_weights.unsqueeze(0).expand(B, -1)  # (B, T)
         time_weights = time_weights / seq_lengths.unsqueeze(1)  # (B, T)
-        time_weights = 5 * torch.exp(- 3 * time_weights) + 1  # Exponential weights, (B, T)
+        time_weights = torch.exp(2.0 * time_weights)  # Mildly upweight later timesteps.
         time_weights = time_weights * valid_masks  # (B, T)
         weights_normalizer = time_weights.sum(-1) / seq_lengths # (B,)
         time_weights = time_weights / weights_normalizer.unsqueeze(1)  # (B, T)
