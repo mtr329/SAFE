@@ -33,7 +33,7 @@ python -m failure_prob.pipeline.train_new \
     model.n_heads=4 \
     model.dropout=0.15 \
     model.lambda_reg=0.05 \
-    model.cumsum=True \
-    model.n_history_steps=16,24 \
+    model.cumsum=Falsed \
+    model.n_history_steps=-1 \
     train.seed=0-1-2 \
     train.exp_suffix=trans
